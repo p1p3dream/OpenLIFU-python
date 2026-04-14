@@ -239,7 +239,12 @@ def run_simulation(arr: xdc.Transducer,
     if not all(unit == units[0] for unit in units):
         raise ValueError("All dimensions must have the same units")
     scl = getunitconversion(units[0], 'm')
-    array_offset =[-float(coord.mean())*scl for coord in params.coords.values()]
+    # Build array offset in [x, y, z] order to match kWaveArray's convention.
+    # params.coords may be in any order (e.g. z, y, x), so we map by name.
+    _dim_order = {'x': 0, 'y': 1, 'z': 2}
+    array_offset = [0.0, 0.0, 0.0]
+    for dim in params.dims:
+        array_offset[_dim_order[dim]] = -float(params.coords[dim].to_numpy().mean()) * scl
 
     medium = get_medium(params, ref_values_only=ref_values_only)
     if _sensor is not None:
