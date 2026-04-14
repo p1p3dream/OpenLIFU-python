@@ -19,8 +19,16 @@ def get_kgrid(coords: xa.Coordinates, t_end = 0, dt = 0, sound_speed_ref=1500, c
     if not all(unit == units[0] for unit in units):
         raise ValueError("All coordinates must have the same units")
     scl = getunitconversion(units[0], 'm')
-    sz = [len(coord) for coord in coords.values()]
-    dx = [np.diff(coord)[0]*scl for coord in coords.values()]
+    # kWaveGrid expects [Nx, Ny, Nz] = [x, y, z] order.
+    # coords.dims may be in any order (e.g. z, y, x), so reorder by name.
+    _dim_order = {'x': 0, 'y': 1, 'z': 2}
+    dim_names = list(coords.dims)
+    sz = [0, 0, 0]
+    dx = [0.0, 0.0, 0.0]
+    for dim in dim_names:
+        idx = _dim_order[dim]
+        sz[idx] = len(coords[dim])
+        dx[idx] = float(np.diff(coords[dim].to_numpy())[0]) * scl
     kgrid = kWaveGrid(sz, dx)
     if dt == 0 or t_end == 0:
         kgrid.makeTime(sound_speed_ref, cfl)
@@ -49,6 +57,15 @@ def get_karray(arr: xdc.Transducer,
     karray.set_array_position(translation, rotation)
     return karray
 
+def _reorder_to_xyz(params: xa.Dataset, var_name: str) -> np.ndarray:
+    """Reorder a 3D variable from params dim order to [x, y, z] for k-wave."""
+    arr = params[var_name]
+    target_order = ['x', 'y', 'z']
+    current_order = list(arr.dims)
+    if current_order == target_order:
+        return arr.data
+    return arr.transpose(*target_order).data
+
 def get_medium(params: xa.Dataset, ref_values_only: bool = False):
     from kwave.kmedium import kWaveMedium
     if ref_values_only:
@@ -58,9 +75,9 @@ def get_medium(params: xa.Dataset, ref_values_only: bool = False):
                              alpha_power=0.9,
                              alpha_mode='no_dispersion')
     else:
-        medium= kWaveMedium(sound_speed=params['sound_speed'].data,
-                        density=params['density'].data,
-                        alpha_coeff=params['attenuation'].data,
+        medium= kWaveMedium(sound_speed=_reorder_to_xyz(params, 'sound_speed'),
+                        density=_reorder_to_xyz(params, 'density'),
+                        alpha_coeff=_reorder_to_xyz(params, 'attenuation'),
                         alpha_power=0.9,
                         alpha_mode='no_dispersion')
     return medium
@@ -301,24 +318,38 @@ def run_simulation(arr: xdc.Transducer,
                 pathlib.Path(fpath).unlink(missing_ok=True)
     logging.info('Simulation Complete')
 
-    sz = list(params.coords.sizes.values())
+    # k-wave output is in [Nx, Ny, Nz] = [x, y, z] order (Fortran).
+    # Reshape to [x, y, z] then build xarray with named dims so it
+    # aligns with params coords regardless of their original order.
+    _dim_order = {'x': 0, 'y': 1, 'z': 2}
+    sz_xyz = [0, 0, 0]
+    for dim in params.dims:
+        sz_xyz[_dim_order[dim]] = params.sizes[dim]
+    xyz_dims = ['x', 'y', 'z']
+
+    def _reshape_output(flat):
+        """Reshape flat k-wave output to xarray with correct dim names."""
+        arr_xyz = flat.reshape(sz_xyz, order='F')
+        da = xa.DataArray(arr_xyz, dims=xyz_dims,
+                         coords={d: params.coords[d] for d in xyz_dims})
+        # Transpose to match params dim order
+        return da.transpose(*params.dims)
+
     ds_dict = {}
     for record in sensor.record:
         if record == 'p_max':
-            ds_dict['p_max'] = xa.DataArray(output['p_max'].reshape(sz, order='F'),
-                                coords=params.coords,
-                                name='p_max',
-                                attrs={'units':'Pa', 'long_name':'PPP'})
+            ds_dict['p_max'] = _reshape_output(output['p_max']).assign_attrs(
+                                units='Pa', long_name='PPP')
+            ds_dict['p_max'].name = 'p_max'
         elif record == 'p_min':
-            ds_dict['p_min'] = xa.DataArray(-1*output['p_min'].reshape(sz, order='F'),
-                            coords=params.coords,
-                            name='p_min',
-                            attrs={'units':'Pa', 'long_name':'PNP'})
-            Z = params['density'].data*params['sound_speed'].data
-            ds_dict['intensity'] = xa.DataArray(1e-4*output['p_min'].reshape(sz, order='F')**2/(2*Z),
-                         coords=params.coords,
-                         name='I',
-                         attrs={'units':'W/cm^2', 'long_name':'Intensity'})
+            ds_dict['p_min'] = (-1 * _reshape_output(output['p_min'])).assign_attrs(
+                            units='Pa', long_name='PNP')
+            ds_dict['p_min'].name = 'p_min'
+            Z = params['density'] * params['sound_speed']
+            pmin_reshaped = _reshape_output(output['p_min'])
+            ds_dict['intensity'] = (1e-4 * pmin_reshaped**2 / (2 * Z))
+            ds_dict['intensity'].attrs = {'units': 'W/cm^2', 'long_name': 'Intensity'}
+            ds_dict['intensity'].name = 'I'
         elif record == 'p':
             pcoords = params.coords.copy()
             pcoords['t'] = np.arange(0, output['Nt']*kgrid.dt, kgrid.dt)
