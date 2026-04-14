@@ -134,21 +134,21 @@ class SimulationCorrected(DelayMethod):
         freq = arr.frequency
 
         # Compute element positions in the simulation coordinate frame.
-        # The simulation grid uses params.coords (typically in mm).
-        # Element.get_position applies the transform matrix AFTER unit
-        # conversion, so the matrix must be in the requested output units.
-        # To avoid mismatches, get positions directly in grid units.
+        # get_position returns [x, y, z] but the grid dims may be in a
+        # different order (e.g. [z, y, x]). We map dim names to position
+        # component indices so each axis is compared correctly.
         coord_dims = list(params.coords.dims)
         coord_units = params[coord_dims[0]].attrs.get('units', 'mm')
+        _DIM_IDX = {'x': 0, 'y': 1, 'z': 2}
 
         matrix = transform if transform is not None else np.eye(4)
-        element_positions_grid = np.array([
+        element_positions_raw = np.array([
             el.get_position(units=coord_units, matrix=matrix)
             for el in arr.elements
         ])
 
-        # Get target position in grid units
-        target_pos_grid = target.get_position(units=coord_units)
+        # Get target position in grid units (also [x, y, z] order)
+        target_pos_raw = target.get_position(units=coord_units)
 
         # Build the sensor mask: find nearest grid indices for each element
         coord_arrays = [params.coords[dim].to_numpy() for dim in coord_dims]
@@ -156,20 +156,24 @@ class SimulationCorrected(DelayMethod):
 
         sensor_indices = []
         out_of_grid = set()
-        for el_i, epos in enumerate(element_positions_grid):
+        for el_i, epos_xyz in enumerate(element_positions_raw):
             idx = []
             inside = True
-            for dim_i, coord_vals in enumerate(coord_arrays):
+            for dim_i, dim_name in enumerate(coord_dims):
+                coord_vals = coord_arrays[dim_i]
+                pos_component = epos_xyz[_DIM_IDX[dim_name]]
                 cmin, cmax = float(coord_vals[0]), float(coord_vals[-1])
+                if cmin > cmax:
+                    cmin, cmax = cmax, cmin
                 half_step = abs(float(coord_vals[1] - coord_vals[0])) / 2 if len(coord_vals) > 1 else 0
-                if epos[dim_i] < cmin - half_step or epos[dim_i] > cmax + half_step:
+                if pos_component < cmin - half_step or pos_component > cmax + half_step:
                     inside = False
-                nearest_idx = int(np.argmin(np.abs(coord_vals - epos[dim_i])))
+                nearest_idx = int(np.argmin(np.abs(coord_vals - pos_component)))
                 idx.append(nearest_idx)
             if not inside:
                 out_of_grid.add(el_i)
                 logger.warning(
-                    f"Element {el_i} at position {epos} is outside the simulation grid. "
+                    f"Element {el_i} at position {epos_xyz} is outside the simulation grid. "
                     "Using geometric time-of-flight estimate for this element."
                 )
             sensor_indices.append(tuple(idx))
@@ -181,17 +185,21 @@ class SimulationCorrected(DelayMethod):
 
         # Find the target voxel index, with out-of-grid check
         target_idx = []
-        for dim_i, coord_vals in enumerate(coord_arrays):
+        for dim_i, dim_name in enumerate(coord_dims):
+            coord_vals = coord_arrays[dim_i]
+            pos_component = target_pos_raw[_DIM_IDX[dim_name]]
             cmin, cmax = float(coord_vals[0]), float(coord_vals[-1])
+            if cmin > cmax:
+                cmin, cmax = cmax, cmin
             half_step = abs(float(coord_vals[1] - coord_vals[0])) / 2 if len(coord_vals) > 1 else 0
-            if target_pos_grid[dim_i] < cmin - half_step or target_pos_grid[dim_i] > cmax + half_step:
+            if pos_component < cmin - half_step or pos_component > cmax + half_step:
                 logger.warning(
-                    "Target position %s is outside the simulation grid on axis %d. "
+                    "Target position %s is outside the simulation grid on axis %s. "
                     "Falling back to geometric delays.",
-                    target_pos_grid, dim_i,
+                    target_pos_raw, dim_name,
                 )
                 raise ValueError("Target outside simulation grid")
-            nearest_idx = int(np.argmin(np.abs(coord_vals - target_pos_grid[dim_i])))
+            nearest_idx = int(np.argmin(np.abs(coord_vals - pos_component)))
             target_idx.append(nearest_idx)
         target_idx = tuple(target_idx)
 
@@ -244,9 +252,9 @@ class SimulationCorrected(DelayMethod):
         for el_i, sensor_idx in enumerate(sensor_indices):
             if el_i in out_of_grid:
                 # Element is outside the simulation grid; use geometric fallback.
-                # Compute distance in grid units and convert to meters for TOF.
+                # Both positions are [x,y,z] in grid units.
                 dist_grid = np.linalg.norm(
-                    element_positions_grid[el_i] - target_pos_grid
+                    element_positions_raw[el_i] - target_pos_raw
                 )
                 dist_m = dist_grid * getunitconversion(coord_units, 'm')
                 arrival_times[el_i] = dist_m / sound_speed_ref
