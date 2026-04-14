@@ -139,9 +139,21 @@ def run_point_source_simulation(
     # Build medium
     medium = get_medium(params, ref_values_only=ref_values_only)
 
+    # Reorder masks from params dim order to k-wave [x,y,z] order.
+    # SimulationCorrected builds masks in params.dims order (e.g. z,y,x).
+    dim_names = list(params.dims)
+    _dim_order = {'x': 0, 'y': 1, 'z': 2}
+    perm = [_dim_order[d] for d in dim_names]
+    inv_perm = [0, 0, 0]
+    for i, p in enumerate(perm):
+        inv_perm[p] = i
+    # Transpose from (dim0, dim1, dim2) to (x, y, z)
+    source_mask_xyz = np.transpose(source_mask, inv_perm)
+    sensor_mask_xyz = np.transpose(sensor_mask, inv_perm)
+
     # Build source: short sinusoidal burst at the target voxel
     source = kSource()
-    source.p_mask = source_mask
+    source.p_mask = source_mask_xyz
     t_sig = np.arange(0, n_cycles / freq, dt)
     # Windowed tone burst: Hann window * sine
     if len(t_sig) > 1:
@@ -154,7 +166,7 @@ def run_point_source_simulation(
     source.p = source_signal.reshape(1, -1)
 
     # Build sensor
-    sensor = kSensor(sensor_mask, record=['p'])
+    sensor = kSensor(sensor_mask_xyz, record=['p'])
 
     # Run simulation
     logging.info("Running point source reciprocal simulation for delay correction")
@@ -351,11 +363,14 @@ def run_simulation(arr: xdc.Transducer,
             ds_dict['intensity'].attrs = {'units': 'W/cm^2', 'long_name': 'Intensity'}
             ds_dict['intensity'].name = 'I'
         elif record == 'p':
-            pcoords = params.coords.copy()
+            pcoords = {d: params.coords[d] for d in ['x', 'y', 'z']}
             pcoords['t'] = np.arange(0, output['Nt']*kgrid.dt, kgrid.dt)
-            ds_dict['p'] = xa.DataArray(output['p'].reshape([output['Nt'], *sz], order='F'),
-                         coords=[pcoords[dim] for dim in ['t','x','y','z']],
+            p_xyz = output['p'].reshape([output['Nt'], *sz_xyz], order='F')
+            da_p = xa.DataArray(p_xyz,
+                         dims=['t', 'x', 'y', 'z'],
+                         coords=pcoords,
                          attrs={'units':'Pa', 'long_name':'Pressure'})
+            ds_dict['p'] = da_p.transpose('t', *params.dims)
 
     ds = xa.Dataset(ds_dict)
     if return_kwave_outputs and return_kwave_inputs:

@@ -223,15 +223,18 @@ class SimulationCorrected(DelayMethod):
         # Multiple elements may map to the same voxel if the grid is coarse.
         # We need to map sensor data rows back to elements.
 
-        # Build a lookup: grid index -> sensor_data row index.
-        # The sensor mask was constructed by setting 1 at unique voxel locations.
-        # k-wave returns data for each nonzero voxel in Fortran (column-major) order.
-        nonzero_indices = list(zip(*np.nonzero(sensor_mask)))
-        # k-wave returns sensor data in Fortran (column-major) order of the mask:
-        # x varies fastest, then y, then z. np.nonzero returns C order (row-major),
-        # so we sort by the Fortran linear index to match k-wave's output ordering.
+        # k-wave receives the sensor mask transposed to [x,y,z] order
+        # (done inside run_point_source_simulation). It returns data rows
+        # in Fortran (column-major) order of that xyz mask. We need to
+        # build the voxel-to-row lookup in xyz space, then convert each
+        # sensor_idx (which is in coord_dims order) to xyz before lookup.
+        perm_to_xyz = [coord_dims.index(d) for d in ['x', 'y', 'z']]
+        sensor_mask_xyz = np.transpose(sensor_mask, perm_to_xyz)
+        grid_shape_xyz = sensor_mask_xyz.shape
+
+        nonzero_xyz = list(zip(*np.nonzero(sensor_mask_xyz)))
+
         def fortran_linear_index(idx, shape):
-            # For Fortran order: idx[0] + idx[1]*shape[0] + idx[2]*shape[0]*shape[1]
             lin = idx[0]
             stride = shape[0]
             for d in range(1, len(shape)):
@@ -239,7 +242,7 @@ class SimulationCorrected(DelayMethod):
                 stride *= shape[d]
             return lin
 
-        nonzero_with_fortran = [(fortran_linear_index(idx, grid_shape), idx) for idx in nonzero_indices]
+        nonzero_with_fortran = [(fortran_linear_index(idx, grid_shape_xyz), idx) for idx in nonzero_xyz]
         nonzero_with_fortran.sort(key=lambda x: x[0])
         sorted_nonzero = [item[1] for item in nonzero_with_fortran]
 
@@ -252,7 +255,6 @@ class SimulationCorrected(DelayMethod):
         for el_i, sensor_idx in enumerate(sensor_indices):
             if el_i in out_of_grid:
                 # Element is outside the simulation grid; use geometric fallback.
-                # Both positions are [x,y,z] in grid units.
                 dist_grid = np.linalg.norm(
                     element_positions_raw[el_i] - target_pos_raw
                 )
@@ -260,7 +262,9 @@ class SimulationCorrected(DelayMethod):
                 arrival_times[el_i] = dist_m / sound_speed_ref
                 continue
 
-            row = voxel_to_row[sensor_idx]
+            # Convert sensor_idx from coord_dims order to xyz order
+            sensor_idx_xyz = tuple(sensor_idx[i] for i in perm_to_xyz)
+            row = voxel_to_row[sensor_idx_xyz]
             time_series = sensor_data[row, :]
             # Compute the analytic signal envelope via the Hilbert transform
             analytic = hilbert(time_series)
