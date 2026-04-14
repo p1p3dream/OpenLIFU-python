@@ -135,20 +135,17 @@ class SimulationCorrected(DelayMethod):
 
         # Compute element positions in the simulation coordinate frame.
         # The simulation grid uses params.coords (typically in mm).
-        # Element positions come from the transducer in its native units (typically m).
-        # We need to convert element positions to the same units as the sim grid,
-        # then find the nearest grid voxel for each element.
+        # Element.get_position applies the transform matrix AFTER unit
+        # conversion, so the matrix must be in the requested output units.
+        # To avoid mismatches, get positions directly in grid units.
         coord_dims = list(params.coords.dims)
         coord_units = params[coord_dims[0]].attrs.get('units', 'mm')
-        scl_to_grid = getunitconversion('m', coord_units)
 
         matrix = transform if transform is not None else np.eye(4)
-        element_positions_m = np.array([
-            el.get_position(units="m", matrix=matrix)
+        element_positions_grid = np.array([
+            el.get_position(units=coord_units, matrix=matrix)
             for el in arr.elements
         ])
-        # Convert to grid units
-        element_positions_grid = element_positions_m * scl_to_grid
 
         # Get target position in grid units
         target_pos_grid = target.get_position(units=coord_units)
@@ -246,9 +243,13 @@ class SimulationCorrected(DelayMethod):
 
         for el_i, sensor_idx in enumerate(sensor_indices):
             if el_i in out_of_grid:
-                # Element is outside the simulation grid; use geometric fallback
-                dist = np.linalg.norm(element_positions_m[el_i] - target.get_position(units="m"))
-                arrival_times[el_i] = dist / sound_speed_ref
+                # Element is outside the simulation grid; use geometric fallback.
+                # Compute distance in grid units and convert to meters for TOF.
+                dist_grid = np.linalg.norm(
+                    element_positions_grid[el_i] - target_pos_grid
+                )
+                dist_m = dist_grid * getunitconversion(coord_units, 'm')
+                arrival_times[el_i] = dist_m / sound_speed_ref
                 continue
 
             row = voxel_to_row[sensor_idx]
