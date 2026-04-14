@@ -87,7 +87,7 @@ class TestNNUNetSegmentationConstruction:
         assert "csf" in seg.materials
         assert "gray_matter" in seg.materials
         assert "white_matter" in seg.materials
-        assert "tissue" not in seg.materials
+        assert "tissue" in seg.materials  # kept for label 6 (soft tissue/scalp)
 
     def test_skull_materials(self):
         seg = NNUNetSegmentation(model_type="skull")

@@ -45,9 +45,9 @@ _SKULL_EXTRA_KEYS = frozenset({"tissue"})
 
 
 def _default_materials_fullhead() -> dict[str, Material]:
-    """Default materials dict for fullhead mode (tissue replaced by brain subtypes)."""
+    """Default materials dict for fullhead mode (adds brain subtypes, keeps tissue for scalp)."""
     m = MATERIALS.copy()
-    m.pop("tissue", None)
+    # Keep "tissue" for label 6 (soft tissue/scalp). Add brain subtypes.
     m["csf"] = CSF
     m["gray_matter"] = GRAY_MATTER
     m["white_matter"] = WHITE_MATTER
@@ -129,30 +129,19 @@ class NNUNetSegmentation(SegmentationMethod):
             msg = f"model_type must be one of [{valid}], got '{self.model_type}'."
             raise ValueError(msg)
 
-        # Auto-swap materials for fullhead mode, same pattern as ThresholdMRI.
-        # When the materials dict has "tissue" but not the classified brain
-        # subtypes, replace tissue with csf/gray_matter/white_matter.
-        if (
-            self.model_type == "fullhead"
-            and "tissue" in self.materials
-            and "csf" not in self.materials
-        ):
+        # Auto-add brain tissue materials for fullhead mode.
+        # Unlike ThresholdMRI, we keep "tissue" because the fullhead model
+        # uses it for label 6 (soft tissue/scalp). We only ADD the brain
+        # subtypes if they are missing.
+        if self.model_type == "fullhead" and "csf" not in self.materials:
             self.materials = dict(self.materials)
-            self.materials.pop("tissue")
             self.materials.setdefault("csf", CSF)
             self.materials.setdefault("gray_matter", GRAY_MATTER)
             self.materials.setdefault("white_matter", WHITE_MATTER)
-            if self.ref_material not in self.materials:
-                msg = (
-                    f"ref_material '{self.ref_material}' was removed during "
-                    f"brain tissue auto-swap. Use 'water' or another key in "
-                    f"{set(self.materials.keys())}."
-                )
-                raise ValueError(msg)
 
         # Validate that all required material keys are present.
         if self.model_type == "fullhead":
-            required = _BASE_MATERIAL_KEYS | _FULLHEAD_EXTRA_KEYS
+            required = _BASE_MATERIAL_KEYS | _FULLHEAD_EXTRA_KEYS | {"tissue"}
         else:
             required = _BASE_MATERIAL_KEYS | _SKULL_EXTRA_KEYS
         missing = required - set(self.materials.keys())
