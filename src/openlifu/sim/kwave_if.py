@@ -97,6 +97,107 @@ def get_source(kgrid, karray, source_sig):
     source.p = karray.get_distributed_source_signal(kgrid, source_sig)
     return source
 
+
+def get_point_source(
+    arr: xdc.Transducer,
+    params: xa.Dataset,
+    source_mat: np.ndarray,
+) -> 'kSource':
+    """Build a k-wave source by placing each transducer element as a point source.
+
+    Instead of using kWaveArray BLI (which fails for curved arrays), this maps
+    each element to its nearest grid voxel and assigns its delayed source signal
+    directly. Elements mapping to the same voxel have their signals summed.
+
+    :param arr: Transducer with elements already in the simulation coordinate frame.
+    :param params: Simulation grid dataset (provides coords and their ordering).
+    :param source_mat: Source signals, shape (n_elements, n_timesteps), with delays
+        and apodization already applied by Transducer.calc_output.
+    :returns: kSource with p_mask and p set for k-wave simulation.
+    """
+    from collections import defaultdict
+    from kwave.ksource import kSource
+
+    coord_dims = list(params.dims)
+    coord_units = params[coord_dims[0]].attrs.get('units', 'mm')
+    _DIM_IDX = {'x': 0, 'y': 1, 'z': 2}
+
+    coord_arrays = {dim: params.coords[dim].to_numpy() for dim in coord_dims}
+
+    # Map each element to its nearest grid voxel (in params dim order)
+    voxel_elements = defaultdict(list)  # voxel_tuple -> [element_indices]
+    n_outside = 0
+    for el_i, el in enumerate(arr.elements):
+        pos_xyz = el.get_position(units=coord_units)
+        idx = []
+        inside = True
+        for dim in coord_dims:
+            cv = coord_arrays[dim]
+            pc = pos_xyz[_DIM_IDX[dim]]
+            cmin, cmax = float(cv.min()), float(cv.max())
+            half_step = abs(float(cv[1] - cv[0])) / 2 if len(cv) > 1 else 0
+            if pc < cmin - half_step or pc > cmax + half_step:
+                inside = False
+            idx.append(int(np.argmin(np.abs(cv - pc))))
+        if not inside:
+            n_outside += 1
+            logging.warning(
+                f"Element {el_i} at {pos_xyz} is outside grid, excluded from source."
+            )
+            continue
+        voxel_elements[tuple(idx)].append(el_i)
+
+    if n_outside > 0:
+        logging.info(f"Point source: {len(voxel_elements)} voxels from "
+                     f"{arr.numelements() - n_outside} elements ({n_outside} outside grid)")
+
+    # Build source mask in params dim order, then transpose to xyz
+    grid_shape = tuple(len(coord_arrays[d]) for d in coord_dims)
+    mask_params = np.zeros(grid_shape, dtype=np.int32)
+    for voxel in voxel_elements:
+        mask_params[voxel] = 1
+
+    # Transpose to [x, y, z] for k-wave
+    perm_to_xyz = [coord_dims.index(d) for d in ['x', 'y', 'z']]
+    inv_perm = [0, 0, 0]
+    for i, p in enumerate(perm_to_xyz):
+        inv_perm[p] = i
+    mask_xyz = np.transpose(mask_params, inv_perm)
+
+    # Build signal matrix ordered by k-wave's Fortran traversal of mask_xyz
+    nonzero_xyz = list(zip(*np.nonzero(mask_xyz)))
+
+    def fortran_linear_index(idx, shape):
+        lin = idx[0]
+        stride = shape[0]
+        for d in range(1, len(shape)):
+            lin += idx[d] * stride
+            stride *= shape[d]
+        return lin
+
+    nonzero_sorted = sorted(nonzero_xyz, key=lambda idx: fortran_linear_index(idx, mask_xyz.shape))
+
+    # Map xyz voxel tuples back to params-order voxel tuples for lookup
+    def xyz_to_params(xyz_idx):
+        return tuple(xyz_idx[p] for p in perm_to_xyz)
+
+    n_timesteps = source_mat.shape[1]
+    signal_matrix = np.zeros((len(nonzero_sorted), n_timesteps), dtype=source_mat.dtype)
+
+    for row, xyz_voxel in enumerate(nonzero_sorted):
+        params_voxel = xyz_to_params(xyz_voxel)
+        element_indices = voxel_elements[params_voxel]
+        # Sum signals from all elements at this voxel
+        for el_i in element_indices:
+            signal_matrix[row, :] += source_mat[el_i, :]
+
+    source = kSource()
+    source.p_mask = mask_xyz
+    source.p = signal_matrix
+    logging.info(f"Point source: {len(nonzero_sorted)} source voxels, "
+                 f"{signal_matrix.shape[1]} timesteps")
+    return source
+
 def run_point_source_simulation(
     params: xa.Dataset,
     source_mask: np.ndarray,
@@ -219,6 +320,7 @@ def run_simulation(arr: xdc.Transducer,
                    return_kwave_outputs: bool = False,
                    return_kwave_inputs: bool = False,
                    sensor_record: List[str] = ['p_max', 'p_min'],
+                   source_method: str = 'kwave_array',
                    _source = None,
                    _sensor = None
 ):
@@ -306,11 +408,14 @@ def run_simulation(arr: xdc.Transducer,
                     crosstalk_mat = np.vstack((crosstalk_mat, arr.crosstalk_frac*source_mat[src_idx,:]))
         arr = crosstalk_arr
         source_mat = crosstalk_mat
-    karray = get_karray(arr,
-                        translation=array_offset,
-                        bli_tolerance=bli_tolerance,
-                        upsampling_rate=upsampling_rate)
-    source = get_source(kgrid, karray, source_mat)
+    if source_method == 'point_source':
+        source = get_point_source(arr, params, source_mat)
+    else:
+        karray = get_karray(arr,
+                            translation=array_offset,
+                            bli_tolerance=bli_tolerance,
+                            upsampling_rate=upsampling_rate)
+        source = get_source(kgrid, karray, source_mat)
     logging.info("Running simulation")
     simulation_options = SimulationOptions(
                             pml_auto=True,
