@@ -207,6 +207,19 @@ class SimulationCorrected(DelayMethod):
         source_mask = np.zeros(grid_shape, dtype=int)
         source_mask[target_idx] = 1
 
+        # Compute the required simulation end time so the wave has enough
+        # time to propagate from the point source (target) to the farthest
+        # transducer element.  The auto-calculated time from k-wave is based
+        # on grid extent alone, which can be too short for deep targets.
+        scl_to_m = getunitconversion(coord_units, 'm')
+        dists_m = np.linalg.norm(
+            element_positions_raw - target_pos_raw, axis=1
+        ) * scl_to_m
+        max_dist_m = float(np.max(dists_m))
+        # Propagation time with 1.5x safety margin (skull slows waves below
+        # the reference speed) plus the source pulse duration.
+        t_end_needed = max_dist_m / sound_speed_ref * 1.5 + self.n_cycles / freq
+
         # Run the point source simulation
         sensor_data, dt = run_point_source_simulation(
             params=params,
@@ -217,6 +230,7 @@ class SimulationCorrected(DelayMethod):
             sound_speed_ref=sound_speed_ref,
             cfl=self.cfl,
             gpu=self.gpu,
+            t_end=t_end_needed,
         )
 
         # sensor_data is (n_sensor_points, n_timesteps).

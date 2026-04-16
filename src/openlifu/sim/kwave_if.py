@@ -208,6 +208,7 @@ def run_point_source_simulation(
     cfl: float = 0.3,
     gpu: bool = True,
     ref_values_only: bool = False,
+    t_end: float = 0,
 ):
     """Run a k-wave simulation with a point source and sparse sensor mask.
 
@@ -224,6 +225,11 @@ def run_point_source_simulation(
     :param cfl: Courant-Friedrichs-Lewy number for time stepping.
     :param gpu: Whether to use GPU acceleration.
     :param ref_values_only: If True, use reference (homogeneous) medium values.
+    :param t_end: Minimum simulation end time in seconds.  When > 0 the kgrid
+        time axis is extended to at least this value, overriding the automatic
+        estimate that k-wave derives from the grid extent alone.  This is
+        important for transcranial FUS where the propagation distance from the
+        target to the farthest element can exceed what the grid size implies.
     :returns: Tuple of (sensor_data, dt) where sensor_data is a 2D array
         (n_sensor_points, n_timesteps) and dt is the time step in seconds.
     """
@@ -233,9 +239,57 @@ def run_point_source_simulation(
     from kwave.options.simulation_execution_options import SimulationExecutionOptions
     from kwave.options.simulation_options import SimulationOptions
 
-    # Build kgrid
+    # Build kgrid with auto timing to obtain the CFL-derived dt.
     kgrid = get_kgrid(params.coords, sound_speed_ref=sound_speed_ref, cfl=cfl)
     dt = float(kgrid.dt)
+
+    # Determine the minimum simulation end time.  The caller may supply an
+    # explicit t_end (preferred, since _run_reciprocal_simulation has direct
+    # access to element/target positions).  When t_end is not provided, fall
+    # back to an estimate derived from source/sensor mask positions.
+    min_t_end = 0.0
+    if t_end > 0:
+        min_t_end = t_end
+    else:
+        # Estimate from mask positions (legacy fallback).
+        coord_dims = list(params.dims)
+        coord_units = params[coord_dims[0]].attrs.get('units', 'mm')
+        scl_to_m = getunitconversion(coord_units, 'm')
+        coord_arrays_m = {
+            dim: params.coords[dim].to_numpy() * scl_to_m for dim in coord_dims
+        }
+        src_nz = np.nonzero(source_mask)
+        sen_nz = np.nonzero(sensor_mask)
+        if len(src_nz[0]) > 0 and len(sen_nz[0]) > 0:
+            src_pos = np.stack(
+                [coord_arrays_m[coord_dims[ax]][src_nz[ax]] for ax in range(3)],
+                axis=-1,
+            )
+            sen_pos = np.stack(
+                [coord_arrays_m[coord_dims[ax]][sen_nz[ax]] for ax in range(3)],
+                axis=-1,
+            )
+            from scipy.spatial.distance import cdist
+            max_distance = float(cdist(src_pos, sen_pos).max())
+            # 1.5x safety margin (skull slows waves) + source pulse duration
+            min_t_end = max_distance / sound_speed_ref * 1.5 + n_cycles / freq
+
+    # Extend kgrid time axis if the auto-calculated duration is too short.
+    auto_t_end = float(kgrid.Nt * kgrid.dt)
+    if min_t_end > 0 and auto_t_end < min_t_end:
+        new_Nt = int(np.ceil(min_t_end / dt))
+        logging.info(
+            "Point source sim: extending time from %.1f us (%d steps) "
+            "to %.1f us (%d steps) to ensure full propagation",
+            auto_t_end * 1e6, int(kgrid.Nt),
+            new_Nt * dt * 1e6, new_Nt,
+        )
+        kgrid.setTime(new_Nt, dt)
+    else:
+        logging.info(
+            "Point source sim: auto time %.1f us (%d steps) is sufficient",
+            auto_t_end * 1e6, int(kgrid.Nt),
+        )
 
     # Build medium
     medium = get_medium(params, ref_values_only=ref_values_only)
@@ -364,6 +418,34 @@ def run_simulation(arr: xdc.Transducer,
     delays = delays if delays is not None else np.zeros(arr.numelements())
     apod = apod if apod is not None else np.ones(arr.numelements())
     kgrid = get_kgrid(params.coords, dt=dt, t_end=t_end, cfl=cfl)
+
+    # When t_end is auto (0), the default kgrid time is based on grid extent
+    # alone. For transcranial FUS the needed time is larger because of element
+    # delays, the full propagation path, and signal duration.  Check and
+    # rebuild the kgrid with an explicit t_end when the auto value falls short.
+    if t_end == 0:
+        _coord_units = [params[dim].attrs['units'] for dim in params.dims]
+        _scl_to_m = getunitconversion(_coord_units[0], 'm')
+        _c_ref = float(params['sound_speed'].attrs.get('ref_value', 1500.0))
+        _max_delay = float(np.max(np.abs(delays)))
+        # Grid diagonal in metres (proxy for max propagation distance)
+        _extents_sq = 0.0
+        for dim in params.dims:
+            cv = params.coords[dim].to_numpy()
+            _extents_sq += ((float(cv[-1]) - float(cv[0])) * _scl_to_m) ** 2
+        _grid_diagonal = float(np.sqrt(_extents_sq))
+        _signal_duration = cycles / freq
+        # Total needed time with a 10% safety margin
+        _t_end_needed = (_max_delay + _grid_diagonal / _c_ref + _signal_duration) * 1.1
+        _auto_t_end = float(kgrid.Nt * kgrid.dt)
+        if _auto_t_end < _t_end_needed:
+            logging.info(
+                "run_simulation: auto t_end (%.1f us) too short for "
+                "transcranial sim (need %.1f us); rebuilding kgrid.",
+                _auto_t_end * 1e6, _t_end_needed * 1e6,
+            )
+            kgrid = get_kgrid(params.coords, dt=float(kgrid.dt), t_end=_t_end_needed, cfl=cfl)
+
     t = np.arange(0, np.min([cycles / freq, (kgrid.Nt-np.ceil(max(delays)/kgrid.dt))*kgrid.dt]), kgrid.dt)
     input_signal = amplitude * np.sin(2 * np.pi * freq * t)
     units = [params[dim].attrs['units'] for dim in params.dims]
