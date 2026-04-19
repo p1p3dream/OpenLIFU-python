@@ -41,14 +41,16 @@ def get_karray(arr: xdc.Transducer,
                bli_tolerance: float = 0.05,
                upsampling_rate: int = 5,
                translation: List[float] = [0.,0.,0.],
-               rotation: List[float] = [0.,0.,0.]):
+               rotation: List[float] = [0.,0.,0.],
+               transform: np.ndarray | None = None):
     import kwave
     import kwave.data
     from kwave.utils.kwave_array import kWaveArray
     karray = kWaveArray(bli_tolerance=bli_tolerance, upsampling_rate=upsampling_rate,
                         single_precision=True)
+    matrix = transform if transform is not None else np.eye(4)
     for el in arr.elements:
-        ele_pos = list(el.get_position(units="m"))
+        ele_pos = list(el.get_position(units="m", matrix=matrix))
         ele_w, ele_l = el.get_size(units="m")
         ele_angle = list(el.get_angle(units="deg"))
         karray.add_rect_element(ele_pos, ele_w, ele_l, ele_angle)
@@ -376,7 +378,8 @@ def run_simulation(arr: xdc.Transducer,
                    sensor_record: List[str] = ['p_max', 'p_min'],
                    source_method: str = 'kwave_array',
                    _source = None,
-                   _sensor = None
+                   _sensor = None,
+                   transform: np.ndarray | None = None,
 ):
     """ Run a k-wave simulation for the given transducer array and parameters.
     Args:
@@ -496,7 +499,8 @@ def run_simulation(arr: xdc.Transducer,
         karray = get_karray(arr,
                             translation=array_offset,
                             bli_tolerance=bli_tolerance,
-                            upsampling_rate=upsampling_rate)
+                            upsampling_rate=upsampling_rate,
+                            transform=transform)
         source = get_source(kgrid, karray, source_mat)
     logging.info("Running simulation")
     simulation_options = SimulationOptions(
