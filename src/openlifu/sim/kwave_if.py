@@ -48,7 +48,11 @@ def get_karray(arr: xdc.Transducer,
     from kwave.utils.kwave_array import kWaveArray
     karray = kWaveArray(bli_tolerance=bli_tolerance, upsampling_rate=upsampling_rate,
                         single_precision=True)
-    matrix = transform if transform is not None else np.eye(4)
+    if transform is not None:
+        matrix = np.asarray(transform, dtype=float).copy()
+        matrix[0:3, 3] *= getunitconversion(arr.units, "m")
+    else:
+        matrix = np.eye(4)
     for el in arr.elements:
         ele_pos = list(el.get_position(units="m", matrix=matrix))
         ele_w, ele_l = el.get_size(units="m")

@@ -153,7 +153,11 @@ class SimulationCorrected(DelayMethod):
         coord_units = params[coord_dims[0]].attrs.get('units', 'mm')
         _DIM_IDX = {'x': 0, 'y': 1, 'z': 2}
 
-        matrix = transform if transform is not None else np.eye(4)
+        if transform is not None:
+            matrix = np.asarray(transform, dtype=float).copy()
+            matrix[0:3, 3] *= getunitconversion(arr.units, coord_units)
+        else:
+            matrix = np.eye(4)
         element_positions_raw = np.array([
             el.get_position(units=coord_units, matrix=matrix)
             for el in arr.elements

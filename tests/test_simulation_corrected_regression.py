@@ -106,7 +106,13 @@ def _transducer_to_world_transform(world_center_mm, aperture_normal=(0, 0, -1)):
     `world_center_mm` with aperture pointing along `aperture_normal`.
     For the default normal (0, 0, -1), elements on the local +z side end up
     in the world -z direction, so the focus falls in -z relative to the
-    array center."""
+    array center.
+
+    Translation is expressed in mm, which matches the transducer's native
+    units (`units="mm"` in `_build_ring_transducer`). This is the convention
+    the public transform kwarg expects: translation in transducer-native
+    units. Consumers convert to target units at the get_position call site.
+    """
     T = np.eye(4)
     T[:3, 3] = np.asarray(world_center_mm, dtype=float)
     if aperture_normal == (0, 0, -1):
@@ -145,20 +151,12 @@ def test_homogeneous_water_geometric_focus_with_zero_delays():
 
     delays = np.zeros(N_ELEMENTS)
 
-    try:
-        result = run_simulation(
-            arr=arr, params=params, delays=delays,
-            freq=FREQ_HZ, cycles=3, amplitude=1.0,
-            ref_values_only=True, gpu=False,
-            transform=tx_to_world,
-        )
-    except TypeError as e:
-        if "transform" in str(e):
-            pytest.xfail(
-                "run_simulation does not accept transform yet; Change 2 of "
-                "POSE_FIX_PROPOSAL_2026-04-17.md is not applied."
-            )
-        raise
+    result = run_simulation(
+        arr=arr, params=params, delays=delays,
+        freq=FREQ_HZ, cycles=3, amplitude=1.0,
+        ref_values_only=True, gpu=False,
+        transform=tx_to_world,
+    )
 
     peak_x, peak_y, peak_z = _focal_peak_mm(result["p_max"])
     assert abs(peak_x) < 5.0, f"Peak x {peak_x} should be near 0"
@@ -202,19 +200,12 @@ def test_homogeneous_water_simulation_corrected_focuses_at_target():
             "out-of-grid issue; see POSE_FIX_PROPOSAL_2026-04-17.md."
         )
 
-    try:
-        result = run_simulation(
-            arr=arr, params=params, delays=delays,
-            freq=FREQ_HZ, cycles=3, amplitude=1.0,
-            ref_values_only=True, gpu=False,
-            transform=tx_to_world,
-        )
-    except TypeError as e:
-        if "transform" in str(e):
-            pytest.xfail(
-                "run_simulation does not accept transform yet."
-            )
-        raise
+    result = run_simulation(
+        arr=arr, params=params, delays=delays,
+        freq=FREQ_HZ, cycles=3, amplitude=1.0,
+        ref_values_only=True, gpu=False,
+        transform=tx_to_world,
+    )
 
     peak_x, peak_y, peak_z = _focal_peak_mm(result["p_max"])
     tol_mm = 2 * GRID_DX_MM
