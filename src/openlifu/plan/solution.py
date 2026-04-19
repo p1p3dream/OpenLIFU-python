@@ -58,6 +58,14 @@ class Solution:
     transducer: Annotated[Transducer | None, OpenLIFUFieldData("Transducer", "Transducer used when generating this solution")] = None
     """Transducer used when generating this solution"""
 
+    transform: Annotated[np.ndarray | None, OpenLIFUFieldData("Transducer-to-world transform", "Optional 4x4 affine transform situating the transducer in the simulation/world frame. When None, element positions are used in transducer-local coordinates (identity).")] = None
+    """Optional 4x4 affine transform situating the transducer in the simulation/world frame.
+    When None, element positions are used in transducer-local coordinates (identity).
+    This transform is forwarded to both the delay calculation (`calc_delays`) and the forward
+    simulation (`run_simulation`) so that element positions are consistently registered into
+    the world frame used by the simulation grid.
+    """
+
     date_created: Annotated[datetime, OpenLIFUFieldData("Creation date", "Solution creation time")] = field(default_factory=datetime.now)
     """Solution creation time"""
 
@@ -178,7 +186,8 @@ class Solution:
                     "t_end": sim_options.t_end,
                     "cfl": sim_options.cfl,
                     "amplitude": self.pulse.amplitude * self.voltage,
-                    "gpu": use_gpu
+                    "gpu": use_gpu,
+                    "transform": self.transform,
                 }
             run_simulation_kwargs.update(sim_options.options)
             simulation_output_xarray = run_simulation(
@@ -564,6 +573,8 @@ class Solution:
             solution_dict["apodizations"] = np.array(solution_dict["apodizations"], ndmin=2)
         if solution_dict["transducer"] is not None:
             solution_dict["transducer"] = Transducer.from_dict(solution_dict["transducer"])
+        if solution_dict.get("transform") is not None:
+            solution_dict["transform"] = np.asarray(solution_dict["transform"])
         solution_dict["pulse"] = Pulse.from_dict(solution_dict["pulse"])
         solution_dict["sequence"] = Sequence.from_dict(solution_dict["sequence"])
         solution_dict["foci"] = [

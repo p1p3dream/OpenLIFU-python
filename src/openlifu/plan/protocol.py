@@ -124,8 +124,8 @@ class Protocol:
             d = json.load(f)
         return Protocol.from_dict(d)
 
-    def beamform(self, arr: xdc.Transducer, target:geo.Point, params: xa.Dataset):
-        delays = self.delay_method.calc_delays(arr, target, params)
+    def beamform(self, arr: xdc.Transducer, target:geo.Point, params: xa.Dataset, transform: np.ndarray | None = None):
+        delays = self.delay_method.calc_delays(arr, target, params, transform=transform)
         apod = self.apod_method.calc_apodization(arr, target, params)
         return delays, apod
 
@@ -316,13 +316,28 @@ class Protocol:
         simulation_result_aggregated: xa.Dataset = xa.Dataset()
         foci: List[Point] = self.focal_pattern.get_targets(target)
 
+        # Build the transducer-to-world transform that registers element positions
+        # into the simulation/world frame. Start from the transducer's standoff
+        # transform (identity by default) in the transducer's native units. If a
+        # session with an `array_transform` is provided, pre-compose with that
+        # pose so that the transducer is situated in the subject's volume frame.
+        tx_units = transducer.units
+        transducer_to_world = transducer.get_standoff_transform_in_units(tx_units)
+        if session is not None and getattr(session, "array_transform", None) is not None:
+            session_matrix = np.asarray(session.array_transform.matrix, dtype=float).copy()
+            # Convert session translation into the transducer's native units so
+            # the composition lives in a single consistent unit system.
+            from openlifu.util.units import getunitconversion
+            session_matrix[0:3, 3] *= getunitconversion(session.array_transform.units, tx_units)
+            transducer_to_world = session_matrix @ transducer_to_world
+
         # updating solution sequence if pulse mismatch
         if (self.sequence.pulse_count % len(foci)) != 0:
             self.fix_pulse_mismatch(on_pulse_mismatch, foci)
         # run simulation and aggregate the results
         for focus in foci:
             self.logger.info(f"Beamform for focus {focus}...")
-            delays, apodization = self.beamform(arr=transducer, target=focus, params=params)
+            delays, apodization = self.beamform(arr=transducer, target=focus, params=params, transform=transducer_to_world)
             delays_to_stack.append(delays)
             apodizations_to_stack.append(apodization)
         # instantiate and return the solution
@@ -335,6 +350,7 @@ class Protocol:
             name=f"Solution {timestamp}",
             protocol_id=self.id,
             transducer=transducer,
+            transform=transducer_to_world,
             delays=np.stack(delays_to_stack, axis=0),
             apodizations=np.stack(apodizations_to_stack, axis=0),
             pulse=self.pulse,
