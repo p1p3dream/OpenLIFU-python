@@ -44,6 +44,15 @@ class SimulationCorrected(DelayMethod):
     gpu: Annotated[bool, OpenLIFUFieldData("Use GPU", "Whether to attempt GPU-accelerated simulation")] = True
     """Whether to attempt GPU-accelerated simulation"""
 
+    allow_out_of_grid_fallback: Annotated[
+        bool,
+        OpenLIFUFieldData("Allow Out-of-Grid Fallback", "If True, silently fall back to geometric time-of-flight for elements outside the simulation grid. Default False raises an error, which catches pose / transform configuration bugs."),
+    ] = False
+    """Whether to silently fall back to geometric time-of-flight for elements
+    outside the simulation grid. Default False raises an error so that pose /
+    transform misconfiguration is caught instead of silently producing a large
+    focal error."""
+
     def __post_init__(self):
         if not isinstance(self.c0, int | float):
             raise TypeError("Speed of sound must be a number")
@@ -67,6 +76,9 @@ class SimulationCorrected(DelayMethod):
 
         if not isinstance(self.gpu, bool):
             raise TypeError("gpu must be a boolean")
+
+        if not isinstance(self.allow_out_of_grid_fallback, bool):
+            raise TypeError("allow_out_of_grid_fallback must be a boolean")
 
     def calc_delays(self, arr: Transducer, target: Point, params: xa.Dataset, transform: np.ndarray | None = None):
         """Calculate delays using k-wave simulation with reciprocity.
@@ -159,6 +171,7 @@ class SimulationCorrected(DelayMethod):
         for el_i, epos_xyz in enumerate(element_positions_raw):
             idx = []
             inside = True
+            bad_axis: tuple[str, float, float] | None = None
             for dim_i, dim_name in enumerate(coord_dims):
                 coord_vals = coord_arrays[dim_i]
                 pos_component = epos_xyz[_DIM_IDX[dim_name]]
@@ -167,11 +180,22 @@ class SimulationCorrected(DelayMethod):
                     cmin, cmax = cmax, cmin
                 half_step = abs(float(coord_vals[1] - coord_vals[0])) / 2 if len(coord_vals) > 1 else 0
                 if pos_component < cmin - half_step or pos_component > cmax + half_step:
+                    if inside:
+                        bad_axis = (dim_name, cmin, cmax)
                     inside = False
                 nearest_idx = int(np.argmin(np.abs(coord_vals - pos_component)))
                 idx.append(nearest_idx)
             if not inside:
                 out_of_grid.add(el_i)
+                if not self.allow_out_of_grid_fallback:
+                    dim_name, cmin, cmax = bad_axis
+                    raise ValueError(
+                        f"Element {el_i} at position {epos_xyz} is outside the simulation grid "
+                        f"with coord bounds along {dim_name}=[{cmin}, {cmax}]. "
+                        "This usually means the transducer pose transform is missing or wrong. "
+                        "Set allow_out_of_grid_fallback=True to silently fall back to geometric "
+                        "time-of-flight (not recommended for real pipelines)."
+                    )
                 logger.warning(
                     f"Element {el_i} at position {epos_xyz} is outside the simulation grid. "
                     "Using geometric time-of-flight estimate for this element."
@@ -283,8 +307,19 @@ class SimulationCorrected(DelayMethod):
             # Compute the analytic signal envelope via the Hilbert transform
             analytic = hilbert(time_series)
             envelope = np.abs(analytic)
-            # The arrival time is the time of the envelope peak
-            peak_sample = int(np.argmax(envelope))
+            # Gate out the early-time source-pulse leakage for elements near the
+            # source voxel. Lower bound: geometric ToF minus one period (safety
+            # margin for skull speed-up and numerical dispersion).
+            geometric_tof_s = (
+                np.linalg.norm(element_positions_raw[el_i] - target_pos_raw)
+                * scl_to_m
+                / sound_speed_ref
+            )
+            gate_start = max(0, int((geometric_tof_s - 1.0 / freq) / dt))
+            if gate_start >= len(envelope):
+                gate_start = 0  # fallback, should not happen given t_end margin
+            # The arrival time is the time of the envelope peak after the gate
+            peak_sample = gate_start + int(np.argmax(envelope[gate_start:]))
             arrival_times[el_i] = peak_sample * dt
 
         return arrival_times
@@ -307,5 +342,6 @@ class SimulationCorrected(DelayMethod):
             {"Name": "CFL Number", "Value": self.cfl, "Unit": ""},
             {"Name": "Source Cycles", "Value": self.n_cycles, "Unit": ""},
             {"Name": "Use GPU", "Value": self.gpu, "Unit": ""},
+            {"Name": "Allow Out-of-Grid Fallback", "Value": self.allow_out_of_grid_fallback, "Unit": ""},
         ]
         return pd.DataFrame.from_records(records)
