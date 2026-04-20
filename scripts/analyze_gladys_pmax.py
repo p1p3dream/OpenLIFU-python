@@ -101,6 +101,71 @@ def find_target(mri_path):
     return target_mm, int(np.argmax(dists))
 
 
+def compute_focal_gain(pmax, coords, target_mm, element_positions_mm,
+                       aperture_band_radius_mm=10.0):
+    """Focal gain = p@target divided by near-aperture reference pressure.
+
+    The "aperture band" is the union of spherical shells of radius
+    aperture_band_radius_mm around every element position. We report gain
+    both versus the mean and versus the max p_max inside that band, since:
+      - gain_vs_mean > 1 means the target beats the average near-aperture
+        pressure (a reasonable focus-quality sanity check).
+      - gain_vs_max > 1 means the target beats the brightest Fresnel/near-
+        field lobe near the aperture. For a well-focused skull sim this is
+        the harder test; raw argmax often sits in those near-aperture lobes
+        which is why the naive argmax metric can be misleading.
+
+    For a correctly-focused 64-element array through skull, gain_vs_mean is
+    typically ~2-5x; through water it can be 10-50x. gain < 1 indicates the
+    focus does not dominate its local aperture neighborhood.
+
+    Returns a dict with p_at_target, p_aperture_mean, p_aperture_max,
+    n_aperture_voxels, gain_vs_mean, gain_vs_max.
+    """
+    dims = ("x", "y", "z")
+    cx, cy, cz = coords["x"], coords["y"], coords["z"]
+    xx, yy, zz = np.meshgrid(cx, cy, cz, indexing="ij")
+    coord_stack = np.stack([xx, yy, zz], axis=-1)
+
+    # p@target: nearest voxel
+    tidx = tuple(int(np.argmin(np.abs(coords[dims[ax]] - target_mm[ax]))) for ax in range(3))
+    p_at_target = float(pmax[tidx])
+
+    # Aperture band mask: voxels within aperture_band_radius_mm of any element
+    r2 = aperture_band_radius_mm ** 2
+    band_mask = np.zeros(pmax.shape, dtype=bool)
+    for pos in element_positions_mm:
+        d2 = np.sum((coord_stack - pos) ** 2, axis=-1)
+        band_mask |= d2 <= r2
+
+    n_band = int(band_mask.sum())
+    if n_band == 0:
+        return {
+            "p_at_target": p_at_target,
+            "p_aperture_mean": float("nan"),
+            "p_aperture_max": float("nan"),
+            "n_aperture_voxels": 0,
+            "gain_vs_mean": float("nan"),
+            "gain_vs_max": float("nan"),
+            "aperture_band_radius_mm": aperture_band_radius_mm,
+        }
+
+    band_vals = pmax[band_mask]
+    p_ap_mean = float(band_vals.mean())
+    p_ap_max = float(band_vals.max())
+    gain_mean = p_at_target / p_ap_mean if p_ap_mean > 0 else float("nan")
+    gain_max = p_at_target / p_ap_max if p_ap_max > 0 else float("nan")
+    return {
+        "p_at_target": p_at_target,
+        "p_aperture_mean": p_ap_mean,
+        "p_aperture_max": p_ap_max,
+        "n_aperture_voxels": n_band,
+        "gain_vs_mean": gain_mean,
+        "gain_vs_max": gain_max,
+        "aperture_band_radius_mm": aperture_band_radius_mm,
+    }
+
+
 def analyze(sim_label, pmax_path, target_mm, positions_world):
     pmax, coords = load_nifti_as_xarray_coords(pmax_path)
     dims = ("x", "y", "z")
@@ -123,6 +188,16 @@ def analyze(sim_label, pmax_path, target_mm, positions_world):
           f"({cx[np.unravel_index(pmax.argmax(), pmax.shape)[0]]:.1f}, "
           f"{cy[np.unravel_index(pmax.argmax(), pmax.shape)[1]]:.1f}, "
           f"{cz[np.unravel_index(pmax.argmax(), pmax.shape)[2]]:.1f}) mm")
+
+    # --- Focal gain (p@target vs near-aperture reference) ---
+    fg = compute_focal_gain(pmax, coords, target_mm, positions_world,
+                            aperture_band_radius_mm=10.0)
+    print(f"aperture band r={fg['aperture_band_radius_mm']:.1f} mm, "
+          f"n_voxels={fg['n_aperture_voxels']}")
+    print(f"p_aperture_mean = {fg['p_aperture_mean']:.4f} Pa")
+    print(f"p_aperture_max  = {fg['p_aperture_max']:.4f} Pa")
+    print(f"focal gain (vs mean) = {fg['gain_vs_mean']:.3f}")
+    print(f"focal gain (vs max)  = {fg['gain_vs_max']:.3f}")
 
     # --- Mask sweep ---
     print(f"{'radius_mm':>10} {'max_p':>10} {'x':>7} {'y':>7} {'z':>7} {'err_mm':>8}")
