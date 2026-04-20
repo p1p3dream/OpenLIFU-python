@@ -86,9 +86,10 @@ def _build_ring_transducer():
         y = ARRAY_RADIUS_MM * np.sin(theta)
         z = 0.0  # flat ring; rely on delays for focusing
         el = xdc.Element(
-            x=x, y=y, z=z,
-            az=0.0, el=0.0, roll=0.0,
-            w=5.0, l=5.0,
+            index=i,
+            position=np.array([x, y, z], dtype=float),
+            orientation=np.array([0.0, 0.0, 0.0], dtype=float),
+            size=np.array([5.0, 5.0], dtype=float),
             units="mm",
         )
         elements.append(el)
@@ -108,13 +109,14 @@ def _transducer_to_world_transform(world_center_mm, aperture_normal=(0, 0, -1)):
     in the world -z direction, so the focus falls in -z relative to the
     array center.
 
-    Translation is expressed in mm, which matches the transducer's native
-    units (`units="mm"` in `_build_ring_transducer`). This is the convention
-    the public transform kwarg expects: translation in transducer-native
-    units. Consumers convert to target units at the get_position call site.
+    `world_center_mm` is accepted in mm for call-site ergonomics, but the
+    returned transform's translation column is expressed in meters, matching
+    the world-frame SI convention for the public `transform` kwarg.
+    Consumers pass the matrix straight through to
+    `Element.get_position(units="m", matrix=...)`.
     """
     T = np.eye(4)
-    T[:3, 3] = np.asarray(world_center_mm, dtype=float)
+    T[:3, 3] = np.asarray(world_center_mm, dtype=float) * 1e-3  # mm -> m
     if aperture_normal == (0, 0, -1):
         T[2, 2] = -1
         T[1, 1] = -1  # maintain right-handed frame
@@ -159,6 +161,11 @@ def test_homogeneous_water_geometric_focus_with_zero_delays():
     )
 
     peak_x, peak_y, peak_z = _focal_peak_mm(result["p_max"])
+    print(
+        f"\n[zero-delays test] focal peak (mm): "
+        f"x={peak_x:.3f}, y={peak_y:.3f}, z={peak_z:.3f}  "
+        f"(array plane z={array_world_center_mm[2]})"
+    )
     assert abs(peak_x) < 5.0, f"Peak x {peak_x} should be near 0"
     assert abs(peak_y) < 5.0, f"Peak y {peak_y} should be near 0"
     assert abs(peak_z - array_world_center_mm[2]) < ARRAY_RADIUS_MM, (
@@ -208,6 +215,12 @@ def test_homogeneous_water_simulation_corrected_focuses_at_target():
     )
 
     peak_x, peak_y, peak_z = _focal_peak_mm(result["p_max"])
+    print(
+        f"\n[corrected-delays test] focal peak (mm): "
+        f"x={peak_x:.3f}, y={peak_y:.3f}, z={peak_z:.3f}  "
+        f"target={target_world_mm}  delays(us)="
+        f"{np.asarray(delays) * 1e6}"
+    )
     tol_mm = 2 * GRID_DX_MM
     assert abs(peak_x - target_world_mm[0]) < tol_mm, (
         f"Focal x {peak_x} > {tol_mm} mm from target {target_world_mm[0]}"

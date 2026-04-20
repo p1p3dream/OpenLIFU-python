@@ -163,13 +163,14 @@ class SimulationCorrected(DelayMethod):
         coord_units = params[coord_dims[0]].attrs.get('units', 'mm')
         _DIM_IDX = {'x': 0, 'y': 1, 'z': 2}
 
-        if transform is not None:
-            matrix = np.asarray(transform, dtype=float).copy()
-            matrix[0:3, 3] *= getunitconversion(arr.units, coord_units)
-        else:
-            matrix = np.eye(4)
+        # Convention: `transform` translation column is in meters (world-frame
+        # SI). We compute element positions in meters via get_position(units="m")
+        # and then rescale the result to the grid's coord_units (e.g. mm) so the
+        # downstream voxel-index lookups stay in coord_units.
+        matrix = np.asarray(transform, dtype=float) if transform is not None else np.eye(4)
+        scl_m_to_coord = getunitconversion("m", coord_units)
         element_positions_raw = np.array([
-            el.get_position(units=coord_units, matrix=matrix)
+            el.get_position(units="m", matrix=matrix) * scl_m_to_coord
             for el in arr.elements
         ])
 

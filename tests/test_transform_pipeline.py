@@ -9,11 +9,12 @@ correctly through every consumer:
 - Apodization methods (indirectly, via ``Element.angle_to_point`` /
   ``distance_to_point`` sharing the same ``matrix[0:3, 3]`` scaling rule)
 
-Transform convention (current): the translation column is in the
-transducer's native units (``arr.units``, typically ``"mm"``). Each
-consumer rescales the translation column to its own target units at
-the ``get_position`` / ``distance_to_point`` / ``angle_to_point`` call
-site.
+Transform convention (current): the translation column is always in
+meters (world-frame SI units). Consumers pass the matrix straight
+through to ``Element.get_position(units="m", matrix=matrix)`` /
+``distance_to_point`` / ``angle_to_point``; no per-call rescaling is
+needed because ``get_position`` scales the element's local position to
+meters before left-multiplying the matrix.
 
 Tests 1, 2, 4 are fast (no k-wave).  Tests 3, 5 are ``@pytest.mark.slow``
 and gated by ``pytest.importorskip("kwave")``.
@@ -61,10 +62,14 @@ def _build_small_transducer(positions_mm, units="mm"):
     return xdc.Transducer(elements=elements, frequency=500_000, units=units)
 
 
-def _translation_matrix(delta_mm):
-    """Build a 4x4 translation-only matrix (in transducer-native mm)."""
+def _translation_matrix(delta_m):
+    """Build a 4x4 translation-only matrix (translation in meters).
+
+    The transform convention is: translation column is in meters
+    (world-frame SI units).
+    """
     T = np.eye(4)
-    T[:3, 3] = np.asarray(delta_mm, dtype=float)
+    T[:3, 3] = np.asarray(delta_m, dtype=float)
     return T
 
 
@@ -142,7 +147,7 @@ def test_translation_invariance_direct():
                    target at world ``t``, transform=None (identity).
     - Scenario B: elements at local positions ``p - delta``,
                    target at world ``t`` (same),
-                   transform=T(+delta) in transducer-native mm.
+                   transform=T(+delta) with translation expressed in meters.
 
     Both describe the exact same physical geometry in world space.
     """
@@ -164,11 +169,14 @@ def test_translation_invariance_direct():
     arr_A = _build_small_transducer(local_positions_A_mm)
     delays_A = method.calc_delays(arr_A, target, params=None, transform=None)
 
-    # Scenario B: shift elements by -delta in local coords, transform T(+delta)
+    # Scenario B: shift elements by -delta in local coords (mm, since element
+    # positions are stored in transducer-native mm), transform T(+delta) with
+    # translation expressed in meters (the transform convention).
     delta_mm = np.array([7.0, -3.0, 11.0])
+    delta_m = delta_mm * 1e-3
     local_positions_B_mm = [tuple(np.array(p) - delta_mm) for p in local_positions_A_mm]
     arr_B = _build_small_transducer(local_positions_B_mm)
-    transform_B = _translation_matrix(delta_mm)
+    transform_B = _translation_matrix(delta_m)
     delays_B = method.calc_delays(arr_B, target, params=None, transform=transform_B)
 
     np.testing.assert_allclose(
@@ -285,11 +293,12 @@ def test_cross_method_parity_direct_vs_simulation_corrected_water():
         local_positions_mm.append((x, y, z))
     arr = _build_small_transducer(local_positions_mm)
 
-    # Non-identity pose: translate by (5, 0, 5) mm, rotate 10 degrees about x.
-    # Small z translation keeps the bowl elements well inside the 64 mm grid
-    # (z_world max ~ 9 mm vs grid bound z = 31 mm) so _run_reciprocal_simulation
-    # actually runs instead of hitting the out-of-grid raise.
-    T_translate = _translation_matrix((5.0, 0.0, 5.0))
+    # Non-identity pose: translate by (5, 0, 5) mm (= 0.005 m), rotate 10
+    # degrees about x. Small z translation keeps the bowl elements well inside
+    # the 64 mm grid (z_world max ~ 9 mm vs grid bound z = 31 mm) so
+    # _run_reciprocal_simulation actually runs instead of hitting the
+    # out-of-grid raise. Transform translation is expressed in meters.
+    T_translate = _translation_matrix((0.005, 0.0, 0.005))
     R_tilt = _rotation_matrix_about_axis((1, 0, 0), np.deg2rad(10.0))
     # Rotation about origin first, then translate.  In column-vector / @
     # convention: world = T @ R @ local, so transform = T @ R.
@@ -340,22 +349,21 @@ def test_consumer_parity_world_positions():
     """Every consumer of the transform must agree on where a given element
     lands in world space.
 
+    Under the current convention (transform translation is always in meters),
+    consumers pass the matrix straight through.
+
     We compute element 0's world position via three independent paths that
     mirror the production code:
 
-    1. Direct consumer: ``el.get_position(units="m", matrix=scaled_matrix_to_m)``
-       where the translation column has been rescaled from arr.units (mm)
-       to meters (this mirrors Direct.calc_delays' element-loop scaling).
-    2. SimulationCorrected path: rescale translation column by
-       ``getunitconversion(arr.units, coord_units)``, call
-       ``get_position(units=coord_units, matrix=...)``, then convert the
-       result to meters.  (coord_units comes from the params grid.)
-    3. get_karray path: rescale translation column by
-       ``getunitconversion(arr.units, "m")``, call
-       ``get_position(units="m", matrix=...)``.
+    1. Direct consumer: ``el.get_position(units="m", matrix=matrix)`` with
+       matrix passed through unchanged.
+    2. SimulationCorrected path: ``get_position(units="m", matrix=matrix)``
+       then rescale the result to ``coord_units`` for voxel-index lookups.
+       We then convert back to meters for the parity comparison.
+    3. get_karray path: same as Direct, ``get_position(units="m",
+       matrix=matrix)`` with matrix passed through unchanged.
 
-    If any two paths scale the transform's translation column inconsistently
-    with the consumer-side get_position units, they will disagree.
+    If any two paths disagree, the transform plumbing is inconsistent.
     """
     # 4 elements at distinct local positions (mm)
     local_positions_mm = [
@@ -366,15 +374,15 @@ def test_consumer_parity_world_positions():
     ]
     arr = _build_small_transducer(local_positions_mm)
 
-    # Non-trivial transform: rotate 25 deg about (0, 1, 0), translate (4, -6, 18) mm
+    # Non-trivial transform: rotate 25 deg about (0, 1, 0), translate
+    # (4, -6, 18) mm = (0.004, -0.006, 0.018) m. Translation column is in
+    # meters per the world-frame convention.
     R = _rotation_matrix_about_axis((0, 1, 0), np.deg2rad(25.0))
-    T = _translation_matrix((4.0, -6.0, 18.0))
-    transform_native = _compose(T, R)  # translation column is in arr.units (mm)
+    T = _translation_matrix((0.004, -0.006, 0.018))
+    transform = _compose(T, R)  # translation column is in meters
 
-    # Build a params dataset whose coord units are mm (matches the transducer
-    # native units).  If someone later changes coord_units to, say, meters,
-    # this test will also validate the mm -> m conversion in the SimCorrected
-    # path.  For now, coord_units = "mm".
+    # Build a params dataset whose coord units are mm. The SimCorrected
+    # consumer rescales from meters to coord_units for its voxel indexing.
     params = _build_water_params(n=16, dx_mm=1.0)
     coord_dims = list(params.coords.dims)
     coord_units = params[coord_dims[0]].attrs.get("units", "mm")
@@ -382,25 +390,20 @@ def test_consumer_parity_world_positions():
     el0 = arr.elements[0]
 
     # --- Path 1: Direct consumer ---
-    # Direct rescales the translation column from arr.units to "m".
-    matrix_direct = transform_native.copy()
-    matrix_direct[0:3, 3] *= getunitconversion(arr.units, "m")
-    pos_direct_m = el0.get_position(units="m", matrix=matrix_direct)
+    # Direct passes matrix straight through.
+    pos_direct_m = el0.get_position(units="m", matrix=transform)
 
     # --- Path 2: SimulationCorrected consumer ---
-    # SimCorrected rescales the translation column from arr.units to coord_units,
-    # calls get_position with units=coord_units, then converts the result to m.
-    matrix_sim = transform_native.copy()
-    matrix_sim[0:3, 3] *= getunitconversion(arr.units, coord_units)
-    pos_sim_in_coord_units = el0.get_position(units=coord_units, matrix=matrix_sim)
+    # SimCorrected calls get_position(units="m") and then scales the result
+    # to coord_units for its downstream voxel-index lookup. For this parity
+    # check we convert back to meters.
+    scl_m_to_coord = getunitconversion("m", coord_units)
+    pos_sim_in_coord_units = el0.get_position(units="m", matrix=transform) * scl_m_to_coord
     pos_sim_m = pos_sim_in_coord_units * getunitconversion(coord_units, "m")
 
     # --- Path 3: get_karray consumer ---
-    # get_karray rescales the translation column from arr.units to "m" and
-    # then calls get_position(units="m").  Same logic as Direct in effect.
-    matrix_karray = transform_native.copy()
-    matrix_karray[0:3, 3] *= getunitconversion(arr.units, "m")
-    pos_karray_m = el0.get_position(units="m", matrix=matrix_karray)
+    # get_karray passes matrix straight through.
+    pos_karray_m = el0.get_position(units="m", matrix=transform)
 
     tol_m = 1e-9
     np.testing.assert_allclose(
@@ -460,9 +463,10 @@ def test_out_of_grid_hard_fail():
     ]
     arr = _build_small_transducer(local_positions_mm)
 
-    # Deliberately wrong transform: translate by +500 mm in x, pushing every
-    # element way outside the 16 mm grid (grid half-extent is 8 mm).
-    bad_transform = _translation_matrix((500.0, 0.0, 0.0))
+    # Deliberately wrong transform: translate by +0.5 m (= 500 mm) in x,
+    # pushing every element way outside the 16 mm grid (grid half-extent is
+    # 8 mm). Translation column is in meters per the world-frame convention.
+    bad_transform = _translation_matrix((0.5, 0.0, 0.0))
 
     target = Point(
         position=np.array([0.0, 0.0, 0.0]), units="mm", dims=("x", "y", "z"),

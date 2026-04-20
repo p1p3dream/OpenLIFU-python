@@ -58,8 +58,9 @@ class Solution:
     transducer: Annotated[Transducer | None, OpenLIFUFieldData("Transducer", "Transducer used when generating this solution")] = None
     """Transducer used when generating this solution"""
 
-    transform: Annotated[np.ndarray | None, OpenLIFUFieldData("Transducer-to-world transform", "Optional 4x4 affine transform situating the transducer in the simulation/world frame. When None, element positions are used in transducer-local coordinates (identity).")] = None
+    transform: Annotated[np.ndarray | None, OpenLIFUFieldData("Transducer-to-world transform", "Optional 4x4 affine transform situating the transducer in the simulation/world frame. Translation column is in meters (world-frame SI units). When None, element positions are used in transducer-local coordinates (identity).")] = None
     """Optional 4x4 affine transform situating the transducer in the simulation/world frame.
+    Translation column is in meters (world-frame SI units).
     When None, element positions are used in transducer-local coordinates (identity).
     This transform is forwarded to both the delay calculation (`calc_delays`) and the forward
     simulation (`run_simulation`) so that element positions are consistently registered into
