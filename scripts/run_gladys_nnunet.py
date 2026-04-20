@@ -40,6 +40,9 @@ def _patched_log(level, msg, *args, **kwargs):
     return _orig_log(level, msg, *args, **kwargs)
 
 logging.log = _patched_log
+import contextlib
+import json
+import pathlib
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,7 +64,13 @@ from openlifu.seg.material import MATERIALS, Material
 from openlifu.seg.seg_method import SegmentationMethod
 from openlifu.seg.seg_methods.nnunet_seg import LABEL_MAP_FULLHEAD
 from openlifu.seg.seg_methods.threshold_mri import CSF, GRAY_MATTER, WHITE_MATTER
-from openlifu.sim.kwave_if import run_simulation
+from openlifu.sim.kwave_if import (
+    get_kgrid,
+    get_medium,
+    get_point_source,
+    run_simulation,
+)
+from openlifu.util.units import getunitconversion
 from openlifu.xdc import Transducer
 from openlifu.xdc.element import Element
 
@@ -93,6 +102,12 @@ AMPLITUDE = 1.0
 C0 = 1500.0
 T_END_SAFETY = 2.0
 GRID_MARGIN_MM = 10.0
+
+# Enable the lightweight time-gated probe after each full run_simulation call.
+# Set the env var OPENLIFU_DISABLE_TIMEGATED_PROBE=1 to turn it off at runtime
+# without editing this file. If the extra k-wave call fails for any reason the
+# probe is skipped with a warning and the main pipeline continues.
+ENABLE_TIMEGATED_PROBE = os.environ.get("OPENLIFU_DISABLE_TIMEGATED_PROBE", "") != "1"
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +384,311 @@ def extract_masked_argmax(
         "focal_mm": focal_mm,
         "error": float(np.linalg.norm(focal_mm - target_mm)),
     }
+
+
+# ---------------------------------------------------------------------------
+# Time-gated probe: runs a second lightweight k-wave sim with a sparse sensor
+# mask that records full p(t) at a handful of strategic voxels, then extracts
+# peak pressure within the physical focal-arrival window (tof +/- 2*pulse_dur)
+# vs peak over all time. Motivation: on real skull, p_max@target is often
+# dominated by post-focal reverberation, so the all-time peak overstates the
+# coherent focal pressure. The time-gated window gives a more honest number.
+# ---------------------------------------------------------------------------
+def _run_sparse_sensor_sim(
+    arr: Transducer,
+    params: xa.Dataset,
+    delays: np.ndarray,
+    apod: np.ndarray,
+    sensor_mask_params_order: np.ndarray,
+    freq: float,
+    cycles: int,
+    amplitude: float,
+    dt: float,
+    t_end: float,
+    cfl: float,
+    gpu: bool,
+    ref_values_only: bool,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Run k-wave with a sparse sensor mask, returning raw p(t, sensor).
+
+    Mirrors run_simulation(source_method='point_source') but replaces the full
+    grid sensor with a binary mask covering only the selected sensor voxels.
+    """
+    from kwave.ksensor import kSensor
+    from kwave.kspaceFirstOrder3D import kspaceFirstOrder3D
+    from kwave.options.simulation_execution_options import SimulationExecutionOptions
+    from kwave.options.simulation_options import SimulationOptions
+
+    kgrid = get_kgrid(params.coords, dt=dt, t_end=t_end, cfl=cfl)
+    # Extend time axis same way run_simulation does when t_end==0.
+    if t_end == 0:
+        _coord_units = [params[dim].attrs["units"] for dim in params.dims]
+        _scl_to_m = getunitconversion(_coord_units[0], "m")
+        _c_ref = float(params["sound_speed"].attrs.get("ref_value", 1500.0))
+        _max_delay = float(np.max(np.abs(delays)))
+        _extents_sq = 0.0
+        for dim in params.dims:
+            cv = params.coords[dim].to_numpy()
+            _extents_sq += ((float(cv[-1]) - float(cv[0])) * _scl_to_m) ** 2
+        _grid_diagonal = float(np.sqrt(_extents_sq))
+        _signal_duration = cycles / freq
+        _t_end_needed = (_max_delay + _grid_diagonal / _c_ref + _signal_duration) * 1.1
+        _auto_t_end = float(kgrid.Nt * kgrid.dt)
+        if _auto_t_end < _t_end_needed:
+            kgrid = get_kgrid(params.coords, dt=float(kgrid.dt), t_end=_t_end_needed, cfl=cfl)
+
+    t = np.arange(
+        0,
+        np.min([cycles / freq, (kgrid.Nt - np.ceil(max(delays) / kgrid.dt)) * kgrid.dt]),
+        kgrid.dt,
+    )
+    input_signal = amplitude * np.sin(2 * np.pi * freq * t)
+
+    medium = get_medium(params, ref_values_only=ref_values_only)
+    source_mat = arr.calc_output(input_signal, kgrid.dt, delays, apod)
+    source = get_point_source(arr, params, source_mat)
+
+    # Reorder sensor mask from params order to xyz for k-wave.
+    dim_names = list(params.dims)
+    _dim_order = {"x": 0, "y": 1, "z": 2}
+    perm = [_dim_order[d] for d in dim_names]
+    inv_perm = [0, 0, 0]
+    for i, p in enumerate(perm):
+        inv_perm[p] = i
+    sensor_mask_xyz = np.transpose(sensor_mask_params_order, inv_perm)
+
+    nz = np.nonzero(sensor_mask_xyz)
+    lin = (
+        nz[0].astype(np.int64)
+        + nz[1].astype(np.int64) * sensor_mask_xyz.shape[0]
+        + nz[2].astype(np.int64) * sensor_mask_xyz.shape[0] * sensor_mask_xyz.shape[1]
+    )
+    order = np.argsort(lin)
+    xyz_sensor_indices = np.stack([nz[0][order], nz[1][order], nz[2][order]], axis=-1)
+
+    sensor = kSensor(sensor_mask_xyz, record=["p"])
+    simulation_options = SimulationOptions(
+        pml_auto=True, pml_inside=False, save_to_disk=True, data_cast="single",
+    )
+    execution_options = SimulationExecutionOptions(is_gpu_simulation=gpu)
+    inputs = {
+        "kgrid": kgrid, "source": source, "sensor": sensor, "medium": medium,
+        "simulation_options": simulation_options, "execution_options": execution_options,
+    }
+    logger.info(
+        "Running sparse-sensor probe (%d sensor voxels, ref_values_only=%s)...",
+        int(xyz_sensor_indices.shape[0]), ref_values_only,
+    )
+    try:
+        output = kspaceFirstOrder3D(**deepcopy(inputs))
+    finally:
+        for fpath in [simulation_options.input_filename, simulation_options.output_filename]:
+            with contextlib.suppress(OSError):
+                pathlib.Path(fpath).unlink(missing_ok=True)
+
+    p_sensor = np.asarray(output["p"])
+    if p_sensor.ndim == 1:
+        p_sensor = p_sensor.reshape(-1, 1)
+    return p_sensor, float(kgrid.dt), xyz_sensor_indices
+
+
+def _build_sensor_mask(
+    params: xa.Dataset,
+    target_mm: np.ndarray,
+    aperture_center_mm: np.ndarray,
+) -> tuple[np.ndarray, list[str], list[tuple[int, int, int]], list[np.ndarray]]:
+    """Build the 5-voxel sensor mask in params dim order.
+
+    Returns (mask, names, xyz_indices_list, actual_world_mm_list).
+    """
+    axis_vec = aperture_center_mm - target_mm
+    axis_len = float(np.linalg.norm(axis_vec))
+    if axis_len < 1e-6:
+        raise ValueError("aperture center coincides with target; cannot build sensor mask")
+    axis_unit = axis_vec / axis_len
+
+    perp = None
+    for cand in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])):
+        cross = np.cross(axis_unit, cand)
+        if np.linalg.norm(cross) > 0.5:
+            p = cand - axis_unit * np.dot(cand, axis_unit)
+            p_norm = np.linalg.norm(p)
+            if p_norm > 1e-6:
+                perp = p / p_norm
+                break
+    if perp is None:
+        perp = np.array([1.0, 0.0, 0.0])
+
+    sensor_world_mm = [
+        ("target",        target_mm.copy()),
+        ("aperture_ctr",  aperture_center_mm.copy()),
+        ("midway",        target_mm + 0.5 * axis_vec),
+        ("quarterway",    target_mm + 0.75 * axis_vec),
+        ("off_axis_15mm", target_mm + 15.0 * perp),
+    ]
+
+    sim_dim_names = list(params.dims)
+    sim_coord_params = {d: params.coords[d].to_numpy() for d in sim_dim_names}
+    mask = np.zeros(tuple(len(sim_coord_params[d]) for d in sim_dim_names), dtype=np.int32)
+
+    names: list[str] = []
+    xyz_idx_list: list[tuple[int, int, int]] = []
+    actual_list: list[np.ndarray] = []
+    for name, pos_mm in sensor_world_mm:
+        idx_in_params: list[int] = []
+        idx_in_xyz = [0, 0, 0]
+        actual = np.zeros(3)
+        for _params_ax, dim in enumerate(sim_dim_names):
+            cv = sim_coord_params[dim]
+            xyz_ax = {"x": 0, "y": 1, "z": 2}[dim]
+            val = pos_mm[xyz_ax]
+            i = int(np.argmin(np.abs(cv - val)))
+            idx_in_params.append(i)
+            idx_in_xyz[xyz_ax] = i
+            actual[xyz_ax] = float(cv[i])
+        mask[tuple(idx_in_params)] = 1
+        names.append(name)
+        xyz_idx_list.append(tuple(idx_in_xyz))
+        actual_list.append(actual)
+    return mask, names, xyz_idx_list, actual_list
+
+
+def _run_timegated_probe(
+    *,
+    arr: Transducer,
+    params: xa.Dataset,
+    delays: np.ndarray,
+    apod: np.ndarray,
+    target_mm: np.ndarray,
+    aperture_center_mm: np.ndarray,
+    common_kwargs: dict,
+    ref_values_only: bool,
+    sim_label: str,
+) -> dict | None:
+    """Run the sparse-sensor probe and compute time-gated metrics.
+
+    Returns a dict with per-sensor metrics, raw time series, and a summary
+    p_focal_window@target. Returns None (and logs a warning) on any failure.
+    """
+    try:
+        mask, names, xyz_idx_list, actual_list = _build_sensor_mask(
+            params, target_mm, aperture_center_mm,
+        )
+        probe_kwargs = dict(common_kwargs)
+        # Probe manages its own sensor, not the full-grid one, so we don't
+        # need ref_values_only passed via common_kwargs; we pass it directly.
+        probe_kwargs.pop("arr", None)
+        probe_kwargs.pop("apod", None)
+        # common_kwargs already has freq/cycles/amplitude/dt/t_end/cfl/gpu and
+        # source_method; we don't need source_method for the sparse sim.
+        probe_kwargs.pop("source_method", None)
+
+        t0 = time.time()
+        p_sensor, dt_probe, xyz_order = _run_sparse_sensor_sim(
+            arr=arr,
+            params=params,
+            delays=delays,
+            apod=apod,
+            sensor_mask_params_order=mask,
+            ref_values_only=ref_values_only,
+            **probe_kwargs,
+        )
+        probe_secs = time.time() - t0
+        logger.info(
+            "    [%s] probe done in %.1fs (p shape=%s, dt=%.2f ns)",
+            sim_label, probe_secs, p_sensor.shape, dt_probe * 1e9,
+        )
+
+        pulse_dur = CYCLES / FREQ_HZ  # seconds
+        Nt = p_sensor.shape[0]
+        t_axis = np.arange(Nt) * dt_probe
+
+        def _col_for(xyz_idx_tuple: tuple[int, int, int]) -> int | None:
+            matches = np.where(
+                (xyz_order[:, 0] == xyz_idx_tuple[0])
+                & (xyz_order[:, 1] == xyz_idx_tuple[1])
+                & (xyz_order[:, 2] == xyz_idx_tuple[2])
+            )[0]
+            return int(matches[0]) if len(matches) else None
+
+        per_sensor = {}
+        for name, xyz_idx, actual in zip(names, xyz_idx_list, actual_list):
+            col = _col_for(xyz_idx)
+            d_m = float(np.linalg.norm(actual - aperture_center_mm)) * 1e-3
+            tof_s = d_m / C0
+            rec: dict[str, Any] = {
+                "sensor_world_mm": actual.tolist(),
+                "xyz_idx": list(xyz_idx),
+                "tof_s": tof_s,
+                "tof_us": tof_s * 1e6,
+                "dist_from_target_mm": float(np.linalg.norm(actual - target_mm)),
+                "dist_from_aperture_ctr_mm": float(np.linalg.norm(actual - aperture_center_mm)),
+            }
+            if col is None:
+                rec.update({
+                    "column": None,
+                    "p_focal_window_Pa": float("nan"),
+                    "p_allt_Pa": float("nan"),
+                    "ratio": float("nan"),
+                    "p_t": [],
+                    "note": "voxel collision; no dedicated column",
+                })
+            else:
+                p_t = p_sensor[:, col]
+                p_abs = np.abs(p_t)
+                p_allt = float(p_abs.max())
+                t_lo = tof_s - 2.0 * pulse_dur
+                t_hi = tof_s + 2.0 * pulse_dur
+                in_win = (t_axis >= t_lo) & (t_axis <= t_hi)
+                p_fw = float(p_abs[in_win].max()) if in_win.any() else float("nan")
+                ratio = (p_fw / p_allt) if (p_allt > 0 and np.isfinite(p_fw)) else float("nan")
+                rec.update({
+                    "column": col,
+                    "p_focal_window_Pa": p_fw,
+                    "p_allt_Pa": p_allt,
+                    "ratio": ratio,
+                    "p_t": p_t.astype(np.float32).tolist(),
+                    "note": "",
+                })
+            per_sensor[name] = rec
+
+        result = {
+            "sim_label": sim_label,
+            "ref_values_only": bool(ref_values_only),
+            "dt_s": dt_probe,
+            "n_timesteps": int(Nt),
+            "pulse_duration_s": pulse_dur,
+            "focal_window_halfwidth_s": 2.0 * pulse_dur,
+            "c0_m_s": C0,
+            "target_mm": target_mm.tolist(),
+            "aperture_center_mm": aperture_center_mm.tolist(),
+            "sensors": per_sensor,
+            "probe_runtime_s": probe_secs,
+        }
+        # Convenience shortcut for the summary table.
+        tgt = per_sensor.get("target", {})
+        result["p_focal_window_at_target_Pa"] = tgt.get("p_focal_window_Pa", float("nan"))
+        result["p_allt_at_target_Pa"] = tgt.get("p_allt_Pa", float("nan"))
+        result["ratio_at_target"] = tgt.get("ratio", float("nan"))
+        return result
+    except Exception as exc:
+        logger.warning(
+            "Time-gated probe failed for %s (%s); continuing without it.",
+            sim_label, exc, exc_info=True,
+        )
+        return None
+
+
+def _save_timegated_json(result: dict | None, out_path: Path) -> None:
+    """Write the probe result to disk as JSON. No-op if result is None."""
+    if result is None:
+        return
+    try:
+        with open(out_path, "w") as f:
+            json.dump(result, f)
+        logger.info("    Saved time-gated sidecar: %s", out_path)
+    except Exception as exc:
+        logger.warning("Failed to save time-gated sidecar %s: %s", out_path, exc)
 
 
 # ===========================================================================
@@ -682,6 +1002,12 @@ def main():
     print(f"    Completed in {time.time()-t0:.1f}s")
     stats_a = extract_focal_stats(result_a, target_mm, "SIM A (corrected+hetero)", element_positions_mm=positions)
     masked_a_20 = extract_masked_argmax(result_a, target_mm, positions, 20.0)
+    probe_a = _run_timegated_probe(
+        arr=arr, params=sim_params, delays=delays_corrected, apod=apod,
+        target_mm=target_mm, aperture_center_mm=aperture_center_mm,
+        common_kwargs=common_kwargs, ref_values_only=False,
+        sim_label="SIM A (corrected+hetero)",
+    ) if ENABLE_TIMEGATED_PROBE else None
 
     print("\n" + "=" * 72)
     print("[SIM B] Geometric + heterogeneous skull (nnU-Net)")
@@ -691,6 +1017,12 @@ def main():
     print(f"    Completed in {time.time()-t0:.1f}s")
     stats_b = extract_focal_stats(result_b, target_mm, "SIM B (geometric+hetero)", element_positions_mm=positions)
     masked_b_20 = extract_masked_argmax(result_b, target_mm, positions, 20.0)
+    probe_b = _run_timegated_probe(
+        arr=arr, params=sim_params, delays=delays_geo, apod=apod,
+        target_mm=target_mm, aperture_center_mm=aperture_center_mm,
+        common_kwargs=common_kwargs, ref_values_only=False,
+        sim_label="SIM B (geometric+hetero)",
+    ) if ENABLE_TIMEGATED_PROBE else None
 
     print("\n" + "=" * 72)
     print("[SIM C] Geometric + homogeneous water (ref_values_only)")
@@ -700,6 +1032,12 @@ def main():
     print(f"    Completed in {time.time()-t0:.1f}s")
     stats_c = extract_focal_stats(result_c, target_mm, "SIM C (geometric+water)", element_positions_mm=positions)
     masked_c_20 = extract_masked_argmax(result_c, target_mm, positions, 20.0)
+    probe_c = _run_timegated_probe(
+        arr=arr, params=sim_params, delays=delays_geo, apod=apod,
+        target_mm=target_mm, aperture_center_mm=aperture_center_mm,
+        common_kwargs=common_kwargs, ref_values_only=True,
+        sim_label="SIM C (geometric+water)",
+    ) if ENABLE_TIMEGATED_PROBE else None
 
     # -------------------------------------------------------------------
     # 12. Summary
@@ -711,10 +1049,10 @@ def main():
     print(f"Skull path NEAR side      : {skull_path_near_mm:.1f} mm  (ThresholdMRI: ~42 mm)")
     print(f"Skull path FAR  side      : {skull_path_far_mm:.1f} mm")
     print()
-    for label, stats, masked20 in [
-        ("A: Corrected + skull", stats_a, masked_a_20),
-        ("B: Geometric + skull", stats_b, masked_b_20),
-        ("C: Geometric + water", stats_c, masked_c_20),
+    for label, stats, masked20, probe in [
+        ("A: Corrected + skull", stats_a, masked_a_20, probe_a),
+        ("B: Geometric + skull", stats_b, masked_b_20, probe_b),
+        ("C: Geometric + water", stats_c, masked_c_20, probe_c),
     ]:
         print(f"{label}")
         print(f"  raw max_p     = {stats['max_pressure']:.4g} Pa")
@@ -722,14 +1060,54 @@ def main():
         print(f"  raw focal err = {stats['focal_error']:.2f} mm")
         if masked20["max_p"] is not None:
             print(f"  masked@20mm   = {masked20['max_p']:.4g} Pa @ err={masked20['error']:.2f} mm")
+        if probe is not None:
+            p_fw = probe.get("p_focal_window_at_target_Pa", float("nan"))
+            p_al = probe.get("p_allt_at_target_Pa", float("nan"))
+            ratio = probe.get("ratio_at_target", float("nan"))
+            print(f"  p_focal_window@target = {p_fw:.4g} Pa  (p_allt@target = {p_al:.4g} Pa, ratio = {ratio:.3f})")
+        elif ENABLE_TIMEGATED_PROBE:
+            print(f"  p_focal_window@target = (probe failed; see warnings above)")
         print()
+
+    # Compact table summary (matches task spec columns).
+    print("-" * 92)
+    hdr = f"{'Sim':<6}{'max_p(Pa)':>14}{'focal_err':>11}{'p@target':>14}{'p_focal_win@tgt':>18}{'ratio':>9}"
+    print(hdr)
+    print("-" * 92)
+    for sim_letter, stats, probe in [
+        ("A", stats_a, probe_a),
+        ("B", stats_b, probe_b),
+        ("C", stats_c, probe_c),
+    ]:
+        if probe is not None:
+            pfw = probe.get("p_focal_window_at_target_Pa", float("nan"))
+            ratio = probe.get("ratio_at_target", float("nan"))
+            pfw_s = f"{pfw:.4g}" if np.isfinite(pfw) else "NaN"
+            ratio_s = f"{ratio:.3f}" if np.isfinite(ratio) else "NaN"
+        else:
+            pfw_s = "-"
+            ratio_s = "-"
+        print(
+            f"{sim_letter:<6}"
+            f"{stats['max_pressure']:>14.4g}"
+            f"{stats['focal_error']:>11.2f}"
+            f"{stats['p_at_target']:>14.4g}"
+            f"{pfw_s:>18}"
+            f"{ratio_s:>9}"
+        )
+    print("-" * 92)
+    print()
 
     # -------------------------------------------------------------------
     # 13. Save pmax NIfTIs
     # -------------------------------------------------------------------
     results_dir = Path.home() / "Data/openlifu-validation/results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    for sim_label, result in [("corrected", result_a), ("geometric", result_b), ("water", result_c)]:
+    for sim_label, result, probe in [
+        ("corrected", result_a, probe_a),
+        ("geometric", result_b, probe_b),
+        ("water", result_c, probe_c),
+    ]:
         p_max_data = result["p_max"].to_numpy()
         x_coords = result.coords["x"].to_numpy()
         y_coords = result.coords["y"].to_numpy()
@@ -746,6 +1124,10 @@ def main():
         out_path = results_dir / f"gladys_nnunet_{sim_label}_pmax.nii.gz"
         nib.save(nib.Nifti1Image(p_max_data.astype(np.float32), out_affine), str(out_path))
         print(f"    Saved: {out_path}")
+
+        # Time-gated sidecar JSON with raw time series + metrics.
+        sidecar_path = results_dir / f"gladys_nnunet_{sim_label}_timegated.json"
+        _save_timegated_json(probe, sidecar_path)
 
     # -------------------------------------------------------------------
     # 14. Plot: 2D slice + axial profile per sim
