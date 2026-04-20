@@ -108,6 +108,7 @@ def get_point_source(
     arr: xdc.Transducer,
     params: xa.Dataset,
     source_mat: np.ndarray,
+    transform: np.ndarray | None = None,
 ) -> 'kSource':
     """Build a k-wave source by placing each transducer element as a point source.
 
@@ -119,6 +120,12 @@ def get_point_source(
     :param params: Simulation grid dataset (provides coords and their ordering).
     :param source_mat: Source signals, shape (n_elements, n_timesteps), with delays
         and apodization already applied by Transducer.calc_output.
+    :param transform: Optional 4x4 transducer-to-world transform. Follows the
+        Phase B meters convention: the translation column is in meters, and
+        ``Element.get_position(units="m", matrix=matrix)`` scales the local
+        element position to meters before left-multiplying the matrix.  When
+        None, the identity is used (i.e. element positions are read in their
+        native frame).
     :returns: kSource with p_mask and p set for k-wave simulation.
     """
     from collections import defaultdict
@@ -130,11 +137,19 @@ def get_point_source(
 
     coord_arrays = {dim: params.coords[dim].to_numpy() for dim in coord_dims}
 
+    # Phase B transform convention: matrix translation column is in meters.
+    # Element.get_position(units="m", matrix=matrix) scales the element's local
+    # position to meters then applies matrix; we then convert to coord_units
+    # for voxel lookup against params coords.
+    matrix = np.asarray(transform, dtype=float) if transform is not None else np.eye(4)
+    scl_m_to_coord = getunitconversion("m", coord_units)
+
     # Map each element to its nearest grid voxel (in params dim order)
     voxel_elements = defaultdict(list)  # voxel_tuple -> [element_indices]
     n_outside = 0
     for el_i, el in enumerate(arr.elements):
-        pos_xyz = el.get_position(units=coord_units)
+        pos_m = el.get_position(units="m", matrix=matrix)
+        pos_xyz = np.asarray(pos_m) * scl_m_to_coord
         idx = []
         inside = True
         for dim in coord_dims:
@@ -504,7 +519,7 @@ def run_simulation(arr: xdc.Transducer,
         arr = crosstalk_arr
         source_mat = crosstalk_mat
     if source_method == 'point_source':
-        source = get_point_source(arr, params, source_mat)
+        source = get_point_source(arr, params, source_mat, transform=transform)
     else:
         karray = get_karray(arr,
                             translation=array_offset,
