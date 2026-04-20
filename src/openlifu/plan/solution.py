@@ -518,6 +518,12 @@ class Solution:
         if 'logger' in solution_dict:
             solution_dict.pop('logger')
 
+        # Explicitly serialize date_created as an ISO-format string so that
+        # callers who round-trip directly via to_dict/from_dict (bypassing the
+        # JSON layer) get a form that from_dict can parse. asdict() preserves
+        # the raw datetime, which from_dict cannot consume without this.
+        solution_dict["date_created"] = self.date_created.isoformat()
+
         if not include_simulation_data:
             solution_dict.pop('simulation_result')
 
@@ -565,8 +571,12 @@ class Solution:
 
         Returns: The new Solution object.
         """
-        # Convert the dictionary back into a Solution object
-        solution_dict["date_created"] = datetime.fromisoformat(solution_dict["date_created"])
+        # Convert the dictionary back into a Solution object.
+        # Accept either an ISO-format string (the usual case after JSON load
+        # or to_dict) or an already-constructed datetime (for resilience when
+        # callers hand in an in-memory dict that skipped the string stage).
+        if isinstance(solution_dict["date_created"], str):
+            solution_dict["date_created"] = datetime.fromisoformat(solution_dict["date_created"])
         if solution_dict["delays"] is not None:
             solution_dict["delays"] = np.array(solution_dict["delays"])
         if solution_dict["apodizations"] is not None:

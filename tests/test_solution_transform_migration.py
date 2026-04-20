@@ -20,14 +20,12 @@ from openlifu.plan.solution import Solution
 def _default_solution_dict_with_transform(transform: np.ndarray) -> dict:
     """Build a minimal Solution dict suitable for from_dict, with a chosen transform.
 
-    Solution.from_dict expects date_created as an isoformat string (as it
-    would be after json.loads), but asdict/to_dict preserves it as a datetime
-    object. Normalize here so we can exercise from_dict without going through JSON.
+    Solution.to_dict now emits date_created as an ISO-format string directly,
+    and Solution.from_dict tolerates either a string or a datetime, so no
+    extra normalization is required here.
     """
     sol = Solution(transform=transform)
-    d = sol.to_dict(include_simulation_data=False)
-    d["date_created"] = d["date_created"].isoformat()
-    return d
+    return sol.to_dict(include_simulation_data=False)
 
 
 def test_meters_convention_round_trip_unchanged():
