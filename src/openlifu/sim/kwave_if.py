@@ -237,7 +237,9 @@ def run_point_source_simulation(
         important for transcranial FUS where the propagation distance from the
         target to the farthest element can exceed what the grid size implies.
     :returns: Tuple of (sensor_data, dt) where sensor_data is a 2D array
-        (n_sensor_points, n_timesteps) and dt is the time step in seconds.
+        shaped (n_timesteps, n_sensor_points) and dt is the time step in
+        seconds. The second axis is in Fortran (column-major) order of the
+        nonzero sensor voxels in the xyz-transposed sensor mask.
     """
     from kwave.ksensor import kSensor
     from kwave.ksource import kSource
@@ -355,10 +357,14 @@ def run_point_source_simulation(
                 pathlib.Path(fpath).unlink(missing_ok=True)
     logging.info("Point source reciprocal simulation complete")
 
-    # output['p'] has shape (n_sensor_points, n_timesteps)
+    # output['p'] from k-wave-python 0.4.0 has shape (n_timesteps, n_sensor_points)
+    # for a binary sensor mask (verified empirically 2026-04-18 via DIAG
+    # instrumentation: 370 timesteps, 8 sensors -> shape (370, 8)).
     sensor_data = output['p']
     if sensor_data.ndim == 1:
-        sensor_data = sensor_data.reshape(1, -1)
+        # Single-sensor edge case: give it an explicit sensor axis so
+        # downstream code can index [:, col] uniformly.
+        sensor_data = sensor_data.reshape(-1, 1)
 
     return sensor_data, dt
 

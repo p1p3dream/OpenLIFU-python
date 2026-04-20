@@ -271,15 +271,17 @@ class SimulationCorrected(DelayMethod):
             t_end=t_end_needed,
         )
 
-        # sensor_data is (n_sensor_points, n_timesteps).
+        # sensor_data is (n_timesteps, n_sensor_points).
         # Multiple elements may map to the same voxel if the grid is coarse.
-        # We need to map sensor data rows back to elements.
+        # We need to map sensor data columns back to elements.
 
         # k-wave receives the sensor mask transposed to [x,y,z] order
-        # (done inside run_point_source_simulation). It returns data rows
-        # in Fortran (column-major) order of that xyz mask. We need to
-        # build the voxel-to-row lookup in xyz space, then convert each
-        # sensor_idx (which is in coord_dims order) to xyz before lookup.
+        # (done inside run_point_source_simulation). It returns data
+        # columns in Fortran (column-major) order of that xyz mask. We
+        # build the voxel-to-column lookup in xyz space, then convert
+        # each sensor_idx (which is in coord_dims order) to xyz before
+        # lookup. The dict is still called voxel_to_row for historical
+        # reasons; its values are column indices into sensor_data.
         perm_to_xyz = [coord_dims.index(d) for d in ['x', 'y', 'z']]
         sensor_mask_xyz = np.transpose(sensor_mask, perm_to_xyz)
         grid_shape_xyz = sensor_mask_xyz.shape
@@ -316,8 +318,8 @@ class SimulationCorrected(DelayMethod):
 
             # Convert sensor_idx from coord_dims order to xyz order
             sensor_idx_xyz = tuple(sensor_idx[i] for i in perm_to_xyz)
-            row = voxel_to_row[sensor_idx_xyz]
-            time_series = sensor_data[row, :]
+            col = voxel_to_row[sensor_idx_xyz]
+            time_series = sensor_data[:, col]
             # Compute the analytic signal envelope via the Hilbert transform
             analytic = hilbert(time_series)
             envelope = np.abs(analytic)
