@@ -285,8 +285,11 @@ def test_cross_method_parity_direct_vs_simulation_corrected_water():
         local_positions_mm.append((x, y, z))
     arr = _build_small_transducer(local_positions_mm)
 
-    # Non-identity pose: translate by (5, 0, 30) mm, rotate 10 degrees about x
-    T_translate = _translation_matrix((5.0, 0.0, 30.0))
+    # Non-identity pose: translate by (5, 0, 5) mm, rotate 10 degrees about x.
+    # Small z translation keeps the bowl elements well inside the 64 mm grid
+    # (z_world max ~ 9 mm vs grid bound z = 31 mm) so _run_reciprocal_simulation
+    # actually runs instead of hitting the out-of-grid raise.
+    T_translate = _translation_matrix((5.0, 0.0, 5.0))
     R_tilt = _rotation_matrix_about_axis((1, 0, 0), np.deg2rad(10.0))
     # Rotation about origin first, then translate.  In column-vector / @
     # convention: world = T @ R @ local, so transform = T @ R.
@@ -302,8 +305,23 @@ def test_cross_method_parity_direct_vs_simulation_corrected_water():
     direct = Direct(c0=c_ref)
     delays_direct = direct.calc_delays(arr, target, params=params, transform=transform)
 
+    # Spy on _fallback_delays: if SimulationCorrected secretly falls back to
+    # Direct (via its except-ValueError wrapper in calc_delays), we would
+    # trivially pass this test by comparing Direct to Direct. Patch the
+    # fallback to raise loudly so any fallback surfaces as a test failure.
+    from unittest.mock import patch
+
     sim = SimulationCorrected(c0=c_ref, cfl=cfl, n_cycles=3, gpu=False)
-    delays_sim = sim.calc_delays(arr, target, params=params, transform=transform)
+
+    def _no_fallback(self_, arr_, target_, params_, transform_=None):
+        msg = (
+            "SimulationCorrected silently fell back to Direct; "
+            "the k-wave reciprocal simulation path was not exercised."
+        )
+        raise AssertionError(msg)
+
+    with patch.object(SimulationCorrected, "_fallback_delays", _no_fallback):
+        delays_sim = sim.calc_delays(arr, target, params=params, transform=transform)
 
     diff = np.max(np.abs(delays_sim - delays_direct))
     assert diff < tol, (
