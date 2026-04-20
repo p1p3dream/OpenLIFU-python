@@ -575,7 +575,22 @@ class Solution:
         if solution_dict["transducer"] is not None:
             solution_dict["transducer"] = Transducer.from_dict(solution_dict["transducer"])
         if solution_dict.get("transform") is not None:
-            solution_dict["transform"] = np.asarray(solution_dict["transform"])
+            T = np.asarray(solution_dict["transform"], dtype=float)
+            translation_magnitude = float(np.linalg.norm(T[0:3, 3]))
+            if translation_magnitude > 1.0:
+                # Legacy mm-translation Solution (pre-Phase-B convention).
+                # Convert translation column to meters and warn once per load.
+                logger.warning(
+                    "Solution.transform translation magnitude is %.3f, which "
+                    "is implausibly large for a transducer-to-world pose in "
+                    "meters (expected < 1 m for any human-scale transducer). "
+                    "Assuming legacy mm convention and converting to meters. "
+                    "Re-save this Solution to make the format explicit.",
+                    translation_magnitude,
+                )
+                T = T.copy()
+                T[0:3, 3] *= 1e-3
+            solution_dict["transform"] = T
         solution_dict["pulse"] = Pulse.from_dict(solution_dict["pulse"])
         solution_dict["sequence"] = Sequence.from_dict(solution_dict["sequence"])
         solution_dict["foci"] = [
