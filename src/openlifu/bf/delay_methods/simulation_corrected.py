@@ -142,6 +142,16 @@ class SimulationCorrected(DelayMethod):
         else:
             sound_speed_ref = self.c0
 
+        # Maximum sound speed in the grid (e.g. skull bone at ~3000 m/s).
+        # Used below to gate the Hilbert envelope by the EARLIEST plausible
+        # arrival time, since bone shortcuts can beat water-speed paths.
+        if 'sound_speed' in params:
+            sound_speed_max = float(np.max(params['sound_speed'].to_numpy()))
+        else:
+            sound_speed_max = sound_speed_ref
+        # Safety: the earliest-arrival bound must not be later than c_ref would give.
+        sound_speed_max = max(sound_speed_max, sound_speed_ref)
+
         # Get frequency from the transducer
         freq = arr.frequency
 
@@ -312,14 +322,15 @@ class SimulationCorrected(DelayMethod):
             analytic = hilbert(time_series)
             envelope = np.abs(analytic)
             # Gate out the early-time source-pulse leakage for elements near the
-            # source voxel. Lower bound: geometric ToF minus one period (safety
-            # margin for skull speed-up and numerical dispersion).
-            geometric_tof_s = (
+            # source voxel. Lower bound: earliest plausible arrival using c_max
+            # (bone paths at ~3000 m/s can beat water-speed paths), minus a
+            # small 2*dt buffer for numerical dispersion.
+            earliest_arrival_s = (
                 np.linalg.norm(element_positions_raw[el_i] - target_pos_raw)
                 * scl_to_m
-                / sound_speed_ref
+                / sound_speed_max
             )
-            gate_start = max(0, int((geometric_tof_s - 1.0 / freq) / dt))
+            gate_start = max(0, int((earliest_arrival_s - 2 * dt) / dt))
             if gate_start >= len(envelope):
                 gate_start = 0  # fallback, should not happen given t_end margin
             # The arrival time is the time of the envelope peak after the gate
