@@ -113,6 +113,9 @@ log_cli_level = "INFO"
 testpaths = [
   "tests",
 ]
+markers = [
+  "slow: marks tests as slow integration tests (deselect with '-m \"not slow\"'); typically require kwave and/or a real simulation run",
+]
 
 
 [tool.coverage]
