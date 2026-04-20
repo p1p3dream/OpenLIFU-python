@@ -10,7 +10,7 @@ import xarray as xa
 from openlifu.bf.apod_methods import ApodizationMethod
 from openlifu.geo import Point
 from openlifu.util.annotations import OpenLIFUFieldData
-from openlifu.util.units import getunittype
+from openlifu.util.units import getunitconversion, getunittype
 from openlifu.xdc import Transducer
 
 
@@ -41,7 +41,11 @@ class PiecewiseLinear(ApodizationMethod):
 
     def calc_apodization(self, arr: Transducer, target: Point, params: xa.Dataset, transform:np.ndarray | None=None):
         target_pos = target.get_position(units="m")
-        matrix = transform if transform is not None else np.eye(4)
+        if transform is not None:
+            matrix = np.asarray(transform, dtype=float).copy()
+            matrix[0:3, 3] *= getunitconversion(arr.units, "m")
+        else:
+            matrix = np.eye(4)
         angles = np.array([el.angle_to_point(target_pos, units="m", matrix=matrix, return_as=self.units) for el in arr.elements])
         apod = np.zeros(arr.numelements())
         f = ((self.zero_angle - angles) / (self.zero_angle - self.rolloff_angle))
