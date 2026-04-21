@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from openlifu import Protocol, Transducer
@@ -106,3 +107,116 @@ def test_fix_pulse_mismatch(
             assert example_protocol.sequence.pulse_count == 2*num_foci
         elif on_pulse_mismatch is OnPulseMismatchAction.ROUNDDOWN:
             assert example_protocol.sequence.pulse_count == num_foci
+
+
+# ---------------------------------------------------------------------------
+# beamform() plumbing: delay methods that return amplitude weighting alongside
+# delays must get their apod multiplicatively combined with the protocol's
+# apod_method output. Backward-compatible delay methods (Direct,
+# SimulationCorrected) only contribute delays; apod comes from apod_method
+# alone.
+# ---------------------------------------------------------------------------
+
+
+class _DummyDelayMethodScalar:
+    """Minimal non-ComplexWeighted delay method: returns scalar delays only."""
+
+    def __init__(self, delays):
+        self._delays = np.asarray(delays, dtype=float)
+
+    def calc_delays(self, arr, target, params, transform=None):
+        return self._delays
+
+    def calc_delays_and_apod(self, arr, target, params, transform=None):
+        # Base-class style: only delays, apod is None.
+        return self.calc_delays(arr, target, params, transform=transform), None
+
+    def to_table(self):  # pragma: no cover - not exercised here
+        import pandas as pd
+        return pd.DataFrame()
+
+
+class _DummyComplexWeightedMethod:
+    """Minimal delay method that contributes both delays and apod."""
+
+    def __init__(self, delays, apod):
+        self._delays = np.asarray(delays, dtype=float)
+        self._apod = np.asarray(apod, dtype=float)
+
+    def calc_delays(self, arr, target, params, transform=None):
+        return self._delays
+
+    def calc_delays_and_apod(self, arr, target, params, transform=None):
+        return self._delays, self._apod
+
+    def to_table(self):  # pragma: no cover - not exercised here
+        import pandas as pd
+        return pd.DataFrame()
+
+
+class _DummyApodMethod:
+    """Minimal apod method: returns a fixed per-element weight vector."""
+
+    def __init__(self, apod):
+        self._apod = np.asarray(apod, dtype=float)
+
+    def calc_apodization(self, arr, target, params, transform=None):
+        return self._apod
+
+    def to_table(self):  # pragma: no cover - not exercised here
+        import pandas as pd
+        return pd.DataFrame()
+
+
+class TestProtocolBeamformPlumbing:
+    """Direct / scalar-return delay methods vs. tuple-return (ComplexWeighted)."""
+
+    def test_scalar_delay_method_apod_from_apod_method_only(self):
+        """A delay method that returns only delays should not influence apod;
+        the apod_method output is passed through unchanged."""
+        delays_in = np.array([0.0, 1e-6, 2e-6])
+        apod_from_method = np.array([0.5, 1.0, 0.25])
+
+        protocol = Protocol()
+        protocol.delay_method = _DummyDelayMethodScalar(delays_in)
+        protocol.apod_method = _DummyApodMethod(apod_from_method)
+
+        delays, apod = protocol.beamform(arr=None, target=None, params=None)
+        np.testing.assert_array_equal(delays, delays_in)
+        np.testing.assert_array_equal(apod, apod_from_method)
+
+    def test_complex_weighted_delay_method_multiplies_apod(self):
+        """A delay method that returns (delays, apod) should have its apod
+        multiplicatively combined with the apod_method output."""
+        delays_in = np.array([0.0, 1e-6, 2e-6])
+        delay_apod = np.array([0.5, 1.0, 0.25])
+        apod_from_method = np.array([1.0, 0.8, 0.5])
+
+        protocol = Protocol()
+        protocol.delay_method = _DummyComplexWeightedMethod(delays_in, delay_apod)
+        protocol.apod_method = _DummyApodMethod(apod_from_method)
+
+        delays, apod = protocol.beamform(arr=None, target=None, params=None)
+        np.testing.assert_array_equal(delays, delays_in)
+        np.testing.assert_allclose(apod, delay_apod * apod_from_method)
+
+    def test_direct_default_delay_method_backward_compatible(self):
+        """Real Direct delay method should yield unmodified apod_method output
+        (backward compat path: Direct's default calc_delays_and_apod returns
+        (delays, None))."""
+        from openlifu.bf.delay_methods import Direct
+
+        apod_from_method = np.array([0.3, 0.7, 1.0])
+        protocol = Protocol()
+        protocol.delay_method = Direct(c0=1500.0)
+        protocol.apod_method = _DummyApodMethod(apod_from_method)
+
+        # Short-circuit the Direct call so we don't need a full transducer
+        # fixture here; the plumbing we care about is downstream of it.
+        from unittest.mock import patch
+        delays_in = np.array([0.0, 1e-6, 2e-6])
+        with patch.object(Direct, "calc_delays", return_value=delays_in):
+            delays, apod = protocol.beamform(arr=None, target=None, params=None)
+
+        np.testing.assert_array_equal(delays, delays_in)
+        np.testing.assert_array_equal(apod, apod_from_method)

@@ -197,10 +197,17 @@ class TestComplexWeightedBehavior:
         phases = np.array([0.0, np.pi / 4, -np.pi / 3])
 
         method = ComplexWeighted()
+        # Short-circuit the geometric composition so the assertions target
+        # just the narrowband phase math. The composition itself is covered
+        # by the dedicated integration tests below.
         with patch.object(
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
             return_value=(amplitudes, phases, f0),
+        ), patch.object(
+            ComplexWeighted,
+            "_compose_with_geometric",
+            side_effect=lambda phase_delays, *a, **kw: np.asarray(phase_delays),
         ), patch("importlib.util.find_spec", return_value=True):
             delays, apod = method.calc_complex_weights(
                 arr=None, target=None, params=None, transform=None,
@@ -221,6 +228,10 @@ class TestComplexWeightedBehavior:
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
             return_value=(amplitudes, phases, f0),
+        ), patch.object(
+            ComplexWeighted,
+            "_compose_with_geometric",
+            side_effect=lambda phase_delays, *a, **kw: np.asarray(phase_delays),
         ), patch("importlib.util.find_spec", return_value=True):
             delays = method.calc_delays(
                 arr=None, target=None, params=None, transform=None,
@@ -237,6 +248,10 @@ class TestComplexWeightedBehavior:
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
             return_value=(amplitudes, phases, f0),
+        ), patch.object(
+            ComplexWeighted,
+            "_compose_with_geometric",
+            side_effect=lambda phase_delays, *a, **kw: np.asarray(phase_delays),
         ), patch("importlib.util.find_spec", return_value=True):
             d1, a1 = method.calc_complex_weights(None, None, None, None)
             d2, a2 = method.calc_delays_and_apod(None, None, None, None)
@@ -244,8 +259,9 @@ class TestComplexWeightedBehavior:
         np.testing.assert_allclose(a1, a2)
 
     def test_equal_amplitudes_gives_pure_phase_delays(self):
-        """When all a_i are identical, apod should be all-ones and delays
-        reduce to -phi_i/(2*pi*f0), i.e. the pure-phase case."""
+        """When all a_i are identical and the geometric composition is
+        short-circuited, apod should be all-ones and delays reduce to
+        -phi_i/(2*pi*f0), i.e. the pure-phase case."""
         f0 = 500e3
         amplitudes = np.full(8, 0.73)
         rng = np.random.default_rng(42)
@@ -256,6 +272,10 @@ class TestComplexWeightedBehavior:
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
             return_value=(amplitudes, phases, f0),
+        ), patch.object(
+            ComplexWeighted,
+            "_compose_with_geometric",
+            side_effect=lambda phase_delays, *a, **kw: np.asarray(phase_delays),
         ), patch("importlib.util.find_spec", return_value=True):
             delays, apod = method.calc_complex_weights(
                 arr=None, target=None, params=None, transform=None,
@@ -299,3 +319,147 @@ class TestComplexWeightedBehavior:
         mock_fallback.assert_called_once()
         np.testing.assert_array_equal(delays, fallback_delays)
         np.testing.assert_array_equal(apod, np.ones_like(fallback_delays))
+
+
+class TestComplexWeightedGeometricOffset:
+    """Verify that ComplexWeighted returns non-negative, TOF-consistent delays.
+
+    These tests drive the full :meth:`calc_complex_weights` pipeline with a
+    realistic transducer and target so that the internal call to
+    :class:`Direct` actually runs. The reciprocal simulation is mocked so the
+    tests stay fast and deterministic.
+    """
+
+    @staticmethod
+    def _build_transducer():
+        """Build a small 2x2 transducer in front of the target at z=+50mm."""
+        from openlifu import xdc
+
+        elements = []
+        for lat in (-10.0, 10.0):
+            for ele in (-10.0, 10.0):
+                elements.append(
+                    xdc.Element(
+                        position=np.array([lat, ele, 50.0]),
+                        size=np.array([5.0, 5.0]),
+                        units="mm",
+                    ),
+                )
+        return xdc.Transducer(elements=elements, frequency=500_000, units="mm")
+
+    @staticmethod
+    def _build_target():
+        from openlifu.geo import Point
+        return Point(position=(0.0, 0.0, 0.0), units="mm", dims=("x", "y", "z"))
+
+    @staticmethod
+    def _build_params():
+        import xarray as xa
+
+        coords = {}
+        for dim in ("x", "y", "z"):
+            cv = np.linspace(-30.0, 60.0, 31, endpoint=True)
+            coords[dim] = xa.DataArray(cv, dims=[dim], attrs={"units": "mm"})
+
+        shape = (31, 31, 31)
+        sound_speed = xa.DataArray(
+            np.full(shape, 1500.0, dtype=np.float32),
+            dims=("x", "y", "z"),
+            coords=coords,
+            attrs={"units": "m/s", "ref_value": 1500.0},
+        )
+        return xa.Dataset({"sound_speed": sound_speed})
+
+    def test_pure_phase_case_matches_direct(self):
+        """When all phases are zero, the composed delays should equal the
+        pure :class:`Direct` geometric result within floating-point noise."""
+        from openlifu.bf.delay_methods.direct import Direct
+
+        arr = self._build_transducer()
+        target = self._build_target()
+        params = self._build_params()
+
+        f0 = 500e3
+        n_el = len(arr.elements)
+        amplitudes = np.ones(n_el)
+        phases = np.zeros(n_el)
+
+        method = ComplexWeighted(c0=1500.0)
+        with patch.object(
+            ComplexWeighted,
+            "_run_reciprocal_simulation_complex",
+            return_value=(amplitudes, phases, f0),
+        ), patch("importlib.util.find_spec", return_value=True):
+            delays, apod = method.calc_complex_weights(
+                arr=arr, target=target, params=params, transform=None,
+            )
+
+        expected = Direct(c0=1500.0).calc_delays(
+            arr, target, params, transform=None,
+        )
+        np.testing.assert_allclose(delays, expected, atol=1e-9)
+        np.testing.assert_allclose(apod, np.ones(n_el))
+
+    def test_non_negative_delays(self):
+        """For arbitrary (non-trivial) phases, the composed delays must all
+        be non-negative so they can be used directly as transmit times."""
+        arr = self._build_transducer()
+        target = self._build_target()
+        params = self._build_params()
+
+        f0 = 500e3
+        n_el = len(arr.elements)
+        rng = np.random.default_rng(123)
+        amplitudes = rng.uniform(0.3, 1.0, size=n_el)
+        phases = rng.uniform(-np.pi, np.pi, size=n_el)
+
+        method = ComplexWeighted(c0=1500.0)
+        with patch.object(
+            ComplexWeighted,
+            "_run_reciprocal_simulation_complex",
+            return_value=(amplitudes, phases, f0),
+        ), patch("importlib.util.find_spec", return_value=True):
+            delays, _apod = method.calc_complex_weights(
+                arr=arr, target=target, params=params, transform=None,
+            )
+        assert float(np.min(delays)) >= 0.0
+
+    def test_max_perturbation_bounded_by_one_period(self):
+        """The phase perturbation away from the pure Direct result should
+        stay within 1/(2*f0) per element (one half period), because the
+        narrowband phase is wrapped to (-pi, pi]. Bias-up from any negative
+        excursion is allowed on top of that."""
+        from openlifu.bf.delay_methods.direct import Direct
+
+        arr = self._build_transducer()
+        target = self._build_target()
+        params = self._build_params()
+
+        f0 = 500e3
+        n_el = len(arr.elements)
+        rng = np.random.default_rng(7)
+        amplitudes = rng.uniform(0.1, 1.0, size=n_el)
+        phases = rng.uniform(-np.pi, np.pi, size=n_el)
+
+        method = ComplexWeighted(c0=1500.0)
+        with patch.object(
+            ComplexWeighted,
+            "_run_reciprocal_simulation_complex",
+            return_value=(amplitudes, phases, f0),
+        ), patch("importlib.util.find_spec", return_value=True):
+            delays, _apod = method.calc_complex_weights(
+                arr=arr, target=target, params=params, transform=None,
+            )
+        geom = Direct(c0=1500.0).calc_delays(
+            arr, target, params, transform=None,
+        )
+        # phase delay range is +-1/(2*f0), and the safety bias-up can add up
+        # to the full range (1/f0). Use 1/f0 with a small slack as the cap.
+        half_period = 1.0 / (2.0 * f0)
+        # Each element's perturbation = (delays - geom) after the bias-up step.
+        # Worst case: one element at -half_period and another at +half_period;
+        # bias-up shifts both by +half_period so perturbations lie in
+        # [0, +2*half_period] = [0, 1/f0]. Verify that upper bound.
+        perturbation = delays - geom
+        assert float(np.min(perturbation)) >= -1e-12
+        assert float(np.max(perturbation)) <= (1.0 / f0) + 1e-12

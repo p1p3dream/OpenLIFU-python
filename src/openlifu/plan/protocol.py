@@ -125,8 +125,19 @@ class Protocol:
         return Protocol.from_dict(d)
 
     def beamform(self, arr: xdc.Transducer, target:geo.Point, params: xa.Dataset, transform: np.ndarray | None = None):
-        delays = self.delay_method.calc_delays(arr, target, params, transform=transform)
+        # Delay methods may optionally contribute per-element apodization
+        # alongside delays (e.g. ComplexWeighted's narrowband amplitude
+        # weights). The base DelayMethod returns (delays, None); methods that
+        # provide amplitude weighting override calc_delays_and_apod to return
+        # a numpy array for the apod component.
+        delays, delay_method_apod = self.delay_method.calc_delays_and_apod(
+            arr, target, params, transform=transform,
+        )
         apod = self.apod_method.calc_apodization(arr, target, params)
+        if delay_method_apod is not None:
+            # Multiplicative combination: delay-method amplitude weights
+            # modulate on top of the protocol's apodization method output.
+            apod = np.asarray(delay_method_apod, dtype=float) * np.asarray(apod, dtype=float)
         return delays, apod
 
     @staticmethod

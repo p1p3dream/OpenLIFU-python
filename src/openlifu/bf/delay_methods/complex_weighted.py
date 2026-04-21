@@ -40,11 +40,14 @@ class ComplexWeighted(DelayMethod):
 
     Notes:
       - Returned amplitudes are normalized so that max(a_i) == 1.
-      - Returned delays come from the wrapped phase; callers that need
-        absolute time-of-flight should combine these with a nominal geometric
-        delay.
+      - Returned delays are absolute transmit times: the narrowband phase
+        delay is composed internally with the geometric TOF baseline from
+        :class:`Direct` and biased up so ``min(delays) == 0``. Callers do not
+        need to add any further geometric offset.
       - Requires a protocol wiring that accepts both delays and apodization to
-        actually apply the amplitude component. See the design doc
+        actually apply the amplitude component. :class:`openlifu.plan.protocol.Protocol.beamform`
+        already honors the amplitude component returned by
+        :meth:`calc_delays_and_apod`. See the design doc
         ``docs/design/phase_correction_approaches.md``.
     """
 
@@ -158,6 +161,14 @@ class ComplexWeighted(DelayMethod):
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return per-element ``(delays, apod)`` from the narrowband complex weights.
 
+        The returned ``delays`` are absolute transmit times: the narrowband
+        phase delay (wrapped within one period of ``f0``, so magnitude is at
+        most ``1/(2*f0)``) is composed with the nominal geometric time-of-flight
+        baseline from :class:`Direct` and biased up so ``min(delays) == 0``. This
+        keeps all per-element delays non-negative, as required by the transmit
+        path. In the pure-phase limit (all phases zero) the result matches
+        :meth:`Direct.calc_delays` to within floating-point noise.
+
         Falls back to Direct (geometric) delays with unit amplitudes if k-wave
         is not available or the simulation raises.
         """
@@ -176,7 +187,11 @@ class ComplexWeighted(DelayMethod):
             amplitudes, phases, f0 = self._run_reciprocal_simulation_complex(
                 arr, target, params, transform,
             )
-            return self._weights_from_coefficients(amplitudes, phases, f0)
+            phase_delays, apod = self._weights_from_coefficients(amplitudes, phases, f0)
+            delays = self._compose_with_geometric(
+                phase_delays, arr, target, params, transform,
+            )
+            return delays, apod
         except (RuntimeError, ValueError, IndexError, OSError):
             logger.exception(
                 "ComplexWeighted delay calculation failed. "
@@ -193,6 +208,38 @@ class ComplexWeighted(DelayMethod):
     ) -> tuple[np.ndarray, np.ndarray]:
         """Explicit alias for :meth:`calc_complex_weights`."""
         return self.calc_complex_weights(arr, target, params, transform)
+
+    def _compose_with_geometric(
+        self,
+        phase_delays: np.ndarray,
+        arr: Transducer,
+        target: Point,
+        params: xa.Dataset,
+        transform: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Compose narrowband phase delays with a geometric TOF baseline.
+
+        The geometric baseline is computed the same way :class:`Direct` does
+        (``max(TOF) - TOF_i``), which is non-negative by construction. The
+        phase perturbation is at most ``1/(2*f0)`` in magnitude because it
+        comes from a phase wrapped to ``(-pi, pi]``; after summing we still
+        bias the whole array up by ``min(delays)`` so the minimum element
+        delay is exactly zero. The result is a non-negative array suitable
+        for direct use as a transmit delay vector.
+        """
+        from openlifu.bf.delay_methods.direct import Direct
+
+        geom_delays = Direct(c0=self.c0).calc_delays(
+            arr, target, params, transform=transform,
+        )
+        delays = geom_delays + np.asarray(phase_delays, dtype=float)
+        # Safety: if any delay went negative due to the phase perturbation
+        # exceeding the geometric spread in a degenerate case, bias the whole
+        # vector up so min(delays) == 0.
+        min_delay = float(np.min(delays))
+        if min_delay < 0.0:
+            delays = delays - min_delay
+        return delays
 
     # ------------------------------------------------------------------
     # Internals
