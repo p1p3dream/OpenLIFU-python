@@ -124,6 +124,19 @@ EXPANDED_TARGET_HALF_MM = float(os.environ.get("EXPANDED_TARGET_HALF_MM", "5.0")
 #     t_gate(v) = t_water_peak(target) + (|aperture - v| - |aperture - target|) / c0
 # The legacy mode is retained for A/B comparison against the new metric.
 USE_TARGET_GATE_FOR_CUBE = os.environ.get("USE_TARGET_GATE_FOR_CUBE", "") == "1"
+# Optional cap on number of cube voxels whose per-voxel metadata is written
+# into the sidecar JSON. When the cube voxel count exceeds this cap, the
+# sidecar is trimmed to the named sensors plus the single spatial-max cube
+# voxel. Cube aggregate stats (spatial_max_*, cube_n_sensors) are still
+# computed in memory from the full cube before trimming.
+_sidecar_cap_raw = os.environ.get("SIDECAR_MAX_VOXELS", "").strip()
+SIDECAR_MAX_VOXELS: int | None = int(_sidecar_cap_raw) if _sidecar_cap_raw else None
+# Stride for cube probe sampling. 1 = every voxel (default). 2 = every other
+# voxel in each axis (1/8 the sensor count for 3D cube). Useful for large
+# half-extents where the full-density probe sensor tensor would exceed
+# available RAM. Center voxel (ix=iy=iz=0) is always included since 0 % s == 0.
+_stride_raw = os.environ.get("CUBE_PROBE_STRIDE", "1").strip()
+CUBE_PROBE_STRIDE: int = max(1, int(_stride_raw)) if _stride_raw else 1
 
 
 def _default_fullhead_materials() -> dict[str, Material]:
@@ -380,6 +393,7 @@ def _build_sensor_mask(
     aperture_center_mm: np.ndarray,
     expanded_target_cube: bool = False,
     cube_half_mm: float = 5.0,
+    cube_stride: int = 1,
 ) -> tuple[np.ndarray, list[str], list[tuple[int, int, int]], list[np.ndarray]]:
     axis_vec = aperture_center_mm - target_mm
     axis_len = float(np.linalg.norm(axis_vec))
@@ -425,9 +439,16 @@ def _build_sensor_mask(
 
         nx, ny, nz_ = _steps(dx), _steps(dy), _steps(dz)
         existing_positions = {tuple(np.round(pos, 6)) for _, pos in sensor_world_mm}
+        stride = max(1, int(cube_stride))
         for ix in range(-nx, nx + 1):
+            if ix % stride != 0:
+                continue
             for iy in range(-ny, ny + 1):
+                if iy % stride != 0:
+                    continue
                 for iz in range(-nz_, nz_ + 1):
+                    if iz % stride != 0:
+                        continue
                     if ix == 0 and iy == 0 and iz == 0:
                         continue  # target already present
                     pos = np.array([
@@ -500,6 +521,7 @@ def _run_timegated_probe(
             params, target_mm, aperture_center_mm,
             expanded_target_cube=EXPANDED_TARGET_PROBE,
             cube_half_mm=EXPANDED_TARGET_HALF_MM,
+            cube_stride=CUBE_PROBE_STRIDE,
         )
         probe_kwargs = dict(common_kwargs)
         probe_kwargs.pop("arr", None)
@@ -526,13 +548,17 @@ def _run_timegated_probe(
         Nt = p_sensor.shape[0]
         t_axis = np.arange(Nt) * dt_probe
 
+        # Build O(1) lookup from xyz_idx tuple -> column index in p_sensor.
+        # This replaces an earlier O(N) numpy scan that caused O(N^2) total
+        # post-processing time for large cubes (e.g. 25mm/30mm spatial sweeps).
+        _col_index: dict[tuple[int, int, int], int] = {}
+        for _ci in range(xyz_order.shape[0]):
+            _key = (int(xyz_order[_ci, 0]), int(xyz_order[_ci, 1]), int(xyz_order[_ci, 2]))
+            if _key not in _col_index:
+                _col_index[_key] = _ci
+
         def _col_for(xyz_idx_tuple: tuple[int, int, int]) -> int | None:
-            matches = np.where(
-                (xyz_order[:, 0] == xyz_idx_tuple[0])
-                & (xyz_order[:, 1] == xyz_idx_tuple[1])
-                & (xyz_order[:, 2] == xyz_idx_tuple[2])
-            )[0]
-            return int(matches[0]) if len(matches) else None
+            return _col_index.get(tuple(int(v) for v in xyz_idx_tuple))
 
         per_sensor = {}
         # Named sensors get full detail (including time series). Cube sensors
@@ -637,6 +663,7 @@ def _run_timegated_probe(
             "target_gate_center_s": target_gate_center_s,
             "expanded_target_probe": bool(EXPANDED_TARGET_PROBE),
             "cube_half_extent_mm": float(EXPANDED_TARGET_HALF_MM) if EXPANDED_TARGET_PROBE else None,
+            "probe_stride": int(CUBE_PROBE_STRIDE) if EXPANDED_TARGET_PROBE else 1,
             "cube_gate_mode": (
                 "per_voxel_water_calibrated"
                 if (target_gate_center_s is not None and not USE_TARGET_GATE_FOR_CUBE)
@@ -687,6 +714,27 @@ def _run_timegated_probe(
             result["spatial_max_offset_from_target_mm"] = float("nan")
             result["spatial_max_p_focal_window_Pa"] = float("nan")
             result["spatial_max_p_focal_window_water_gate_Pa"] = float("nan")
+
+        # --- Optional sidecar trimming for very large cubes ------------------
+        cube_voxel_count = sum(1 for k in per_sensor.keys() if k.startswith("cube_"))
+        result["sidecar_cube_voxels_original"] = int(cube_voxel_count)
+        result["sidecar_trimmed"] = False
+        if SIDECAR_MAX_VOXELS is not None and cube_voxel_count > SIDECAR_MAX_VOXELS:
+            keep_name = result.get("spatial_max_sensor_name")
+            trimmed: dict = {}
+            for k, v in per_sensor.items():
+                if not k.startswith("cube_"):
+                    trimmed[k] = v
+                elif keep_name is not None and k == keep_name:
+                    trimmed[k] = v
+            logger.info(
+                "    [%s] sidecar trimmed: %d cube voxels -> %d kept (threshold=%d); spatial max @ %s retained",
+                sim_label, cube_voxel_count,
+                sum(1 for k in trimmed if k.startswith("cube_")),
+                SIDECAR_MAX_VOXELS, keep_name,
+            )
+            result["sensors"] = trimmed
+            result["sidecar_trimmed"] = True
         return result
     except Exception as exc:
         logger.warning(
