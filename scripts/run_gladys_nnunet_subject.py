@@ -75,6 +75,7 @@ _probe_helpers = _ilu.module_from_spec(_helper_spec)
 _helper_spec.loader.exec_module(_probe_helpers)
 per_voxel_water_calibrated_gate_center = _probe_helpers.per_voxel_water_calibrated_gate_center
 
+from openlifu.bf.delay_methods.complex_weighted import ComplexWeighted
 from openlifu.bf.delay_methods.direct import Direct
 from openlifu.bf.delay_methods.simulation_corrected import SimulationCorrected
 from openlifu.geo import Point
@@ -137,6 +138,29 @@ SIDECAR_MAX_VOXELS: int | None = int(_sidecar_cap_raw) if _sidecar_cap_raw else 
 # available RAM. Center voxel (ix=iy=iz=0) is always included since 0 % s == 0.
 _stride_raw = os.environ.get("CUBE_PROBE_STRIDE", "1").strip()
 CUBE_PROBE_STRIDE: int = max(1, int(_stride_raw)) if _stride_raw else 1
+
+# --- Bounded-shell spatial probe ---------------------------------------------
+# When PROBE_SHELL_INNER_MM and PROBE_SHELL_OUTER_MM are both set (and outer
+# > inner), replace the cube probe with a spherical shell: include voxels
+# satisfying `inner < ||v - target||_mm <= outer`. This removes cube-corner
+# noise that causes the `max|p_fw|` metric to drift with cube size on
+# reverberant skull sims (GU010). Default outer falls back to
+# EXPANDED_TARGET_HALF_MM for backwards-compat cube behavior.
+_shell_inner_raw = os.environ.get("PROBE_SHELL_INNER_MM", "").strip()
+_shell_outer_raw = os.environ.get("PROBE_SHELL_OUTER_MM", "").strip()
+PROBE_SHELL_INNER_MM: float | None = (
+    float(_shell_inner_raw) if _shell_inner_raw else None
+)
+PROBE_SHELL_OUTER_MM: float | None = (
+    float(_shell_outer_raw) if _shell_outer_raw else None
+)
+# Shell mode is active only if outer is explicitly provided AND outer > inner
+# (inner defaults to 0.0 if outer alone is set).
+if PROBE_SHELL_OUTER_MM is not None:
+    _shell_inner_eff = PROBE_SHELL_INNER_MM if PROBE_SHELL_INNER_MM is not None else 0.0
+    USE_SHELL_PROBE = PROBE_SHELL_OUTER_MM > _shell_inner_eff
+else:
+    USE_SHELL_PROBE = False
 
 
 def _default_fullhead_materials() -> dict[str, Material]:
@@ -394,6 +418,8 @@ def _build_sensor_mask(
     expanded_target_cube: bool = False,
     cube_half_mm: float = 5.0,
     cube_stride: int = 1,
+    shell_inner_mm: float | None = None,
+    shell_outer_mm: float | None = None,
 ) -> tuple[np.ndarray, list[str], list[tuple[int, int, int]], list[np.ndarray]]:
     axis_vec = aperture_center_mm - target_mm
     axis_len = float(np.linalg.norm(axis_vec))
@@ -421,7 +447,12 @@ def _build_sensor_mask(
         ("off_axis_15mm", target_mm + 15.0 * perp),
     ]
 
-    # Optionally add a cube of sensors centered on target.
+    # Optionally add a cube (or shell) of sensors centered on target.
+    use_shell = (
+        expanded_target_cube
+        and shell_outer_mm is not None
+        and shell_outer_mm > (shell_inner_mm if shell_inner_mm is not None else 0.0)
+    )
     if expanded_target_cube:
         # Figure out grid spacing along each axis from params
         sim_dim_names = list(params.dims)
@@ -434,33 +465,78 @@ def _build_sensor_mask(
         dy = float(cy[1] - cy[0]) if len(cy) > 1 else 0.5
         dz = float(cz[1] - cz[0]) if len(cz) > 1 else 0.5
 
-        def _steps(d):
-            return int(round(cube_half_mm / abs(d)))
-
-        nx, ny, nz_ = _steps(dx), _steps(dy), _steps(dz)
         existing_positions = {tuple(np.round(pos, 6)) for _, pos in sensor_world_mm}
         stride = max(1, int(cube_stride))
-        for ix in range(-nx, nx + 1):
-            if ix % stride != 0:
-                continue
-            for iy in range(-ny, ny + 1):
-                if iy % stride != 0:
+
+        if use_shell:
+            # Shell mode: enumerate a bounding cube of half-extent = outer,
+            # then keep only voxels with inner < ||v - target|| <= outer.
+            inner = float(shell_inner_mm) if shell_inner_mm is not None else 0.0
+            outer = float(shell_outer_mm)
+            nx = int(np.ceil(outer / abs(dx)))
+            ny = int(np.ceil(outer / abs(dy)))
+            nz_ = int(np.ceil(outer / abs(dz)))
+            name_prefix = "shell"
+            inner2 = inner * inner
+            outer2 = outer * outer
+            for ix in range(-nx, nx + 1):
+                if ix % stride != 0:
                     continue
-                for iz in range(-nz_, nz_ + 1):
-                    if iz % stride != 0:
+                for iy in range(-ny, ny + 1):
+                    if iy % stride != 0:
                         continue
-                    if ix == 0 and iy == 0 and iz == 0:
-                        continue  # target already present
-                    pos = np.array([
-                        target_mm[0] + ix * dx,
-                        target_mm[1] + iy * dy,
-                        target_mm[2] + iz * dz,
-                    ])
-                    key = tuple(np.round(pos, 6))
-                    if key in existing_positions:
+                    for iz in range(-nz_, nz_ + 1):
+                        if iz % stride != 0:
+                            continue
+                        dvx = ix * dx
+                        dvy = iy * dy
+                        dvz = iz * dz
+                        r2 = dvx * dvx + dvy * dvy + dvz * dvz
+                        # inner < r <= outer ; always retain target (ix=iy=iz=0)
+                        # when inner == 0 (so r2 == 0 passes through when inner2 == 0).
+                        if not (r2 > inner2 and r2 <= outer2):
+                            # include center voxel if inner=0 (target reuse)
+                            if ix == 0 and iy == 0 and iz == 0 and inner <= 0.0:
+                                continue  # target already present in sensor_world_mm
+                            continue
+                        if ix == 0 and iy == 0 and iz == 0:
+                            continue  # target already present
+                        pos = np.array([
+                            target_mm[0] + dvx,
+                            target_mm[1] + dvy,
+                            target_mm[2] + dvz,
+                        ])
+                        key = tuple(np.round(pos, 6))
+                        if key in existing_positions:
+                            continue
+                        existing_positions.add(key)
+                        sensor_world_mm.append((f"{name_prefix}_{ix:+d}_{iy:+d}_{iz:+d}", pos))
+        else:
+            def _steps(d):
+                return int(round(cube_half_mm / abs(d)))
+
+            nx, ny, nz_ = _steps(dx), _steps(dy), _steps(dz)
+            for ix in range(-nx, nx + 1):
+                if ix % stride != 0:
+                    continue
+                for iy in range(-ny, ny + 1):
+                    if iy % stride != 0:
                         continue
-                    existing_positions.add(key)
-                    sensor_world_mm.append((f"cube_{ix:+d}_{iy:+d}_{iz:+d}", pos))
+                    for iz in range(-nz_, nz_ + 1):
+                        if iz % stride != 0:
+                            continue
+                        if ix == 0 and iy == 0 and iz == 0:
+                            continue  # target already present
+                        pos = np.array([
+                            target_mm[0] + ix * dx,
+                            target_mm[1] + iy * dy,
+                            target_mm[2] + iz * dz,
+                        ])
+                        key = tuple(np.round(pos, 6))
+                        if key in existing_positions:
+                            continue
+                        existing_positions.add(key)
+                        sensor_world_mm.append((f"cube_{ix:+d}_{iy:+d}_{iz:+d}", pos))
 
     sim_dim_names = list(params.dims)
     sim_coord_params = {d: params.coords[d].to_numpy() for d in sim_dim_names}
@@ -522,6 +598,8 @@ def _run_timegated_probe(
             expanded_target_cube=EXPANDED_TARGET_PROBE,
             cube_half_mm=EXPANDED_TARGET_HALF_MM,
             cube_stride=CUBE_PROBE_STRIDE,
+            shell_inner_mm=PROBE_SHELL_INNER_MM if USE_SHELL_PROBE else None,
+            shell_outer_mm=PROBE_SHELL_OUTER_MM if USE_SHELL_PROBE else None,
         )
         probe_kwargs = dict(common_kwargs)
         probe_kwargs.pop("arr", None)
@@ -567,7 +645,7 @@ def _run_timegated_probe(
             "target", "aperture_ctr", "midway", "quarterway", "off_axis_15mm",
         }
         for name, xyz_idx, actual in zip(names, xyz_idx_list, actual_list):
-            is_cube = name.startswith("cube_")
+            is_cube = name.startswith("cube_") or name.startswith("shell_")
             col = _col_for(xyz_idx)
             d_m = float(np.linalg.norm(actual - aperture_center_mm)) * 1e-3
             tof_s = d_m / C0  # geometric TOF @ C0 (water speed)
@@ -664,6 +742,9 @@ def _run_timegated_probe(
             "expanded_target_probe": bool(EXPANDED_TARGET_PROBE),
             "cube_half_extent_mm": float(EXPANDED_TARGET_HALF_MM) if EXPANDED_TARGET_PROBE else None,
             "probe_stride": int(CUBE_PROBE_STRIDE) if EXPANDED_TARGET_PROBE else 1,
+            "shell_probe": bool(USE_SHELL_PROBE),
+            "shell_inner_mm": float(PROBE_SHELL_INNER_MM) if (USE_SHELL_PROBE and PROBE_SHELL_INNER_MM is not None) else None,
+            "shell_outer_mm": float(PROBE_SHELL_OUTER_MM) if (USE_SHELL_PROBE and PROBE_SHELL_OUTER_MM is not None) else None,
             "cube_gate_mode": (
                 "per_voxel_water_calibrated"
                 if (target_gate_center_s is not None and not USE_TARGET_GATE_FOR_CUBE)
@@ -684,7 +765,7 @@ def _run_timegated_probe(
         use_water_gate_for_cube = target_gate_center_s is not None
         cube_candidates = []
         for s_name, s_rec in per_sensor.items():
-            if not (s_name == "target" or s_name.startswith("cube_")):
+            if not (s_name == "target" or s_name.startswith("cube_") or s_name.startswith("shell_")):
                 continue
             if use_water_gate_for_cube:
                 val = s_rec.get("p_focal_window_water_gate_Pa", float("nan"))
@@ -716,21 +797,24 @@ def _run_timegated_probe(
             result["spatial_max_p_focal_window_water_gate_Pa"] = float("nan")
 
         # --- Optional sidecar trimming for very large cubes ------------------
-        cube_voxel_count = sum(1 for k in per_sensor.keys() if k.startswith("cube_"))
+        cube_voxel_count = sum(
+            1 for k in per_sensor.keys()
+            if k.startswith("cube_") or k.startswith("shell_")
+        )
         result["sidecar_cube_voxels_original"] = int(cube_voxel_count)
         result["sidecar_trimmed"] = False
         if SIDECAR_MAX_VOXELS is not None and cube_voxel_count > SIDECAR_MAX_VOXELS:
             keep_name = result.get("spatial_max_sensor_name")
             trimmed: dict = {}
             for k, v in per_sensor.items():
-                if not k.startswith("cube_"):
+                if not (k.startswith("cube_") or k.startswith("shell_")):
                     trimmed[k] = v
                 elif keep_name is not None and k == keep_name:
                     trimmed[k] = v
             logger.info(
-                "    [%s] sidecar trimmed: %d cube voxels -> %d kept (threshold=%d); spatial max @ %s retained",
+                "    [%s] sidecar trimmed: %d cube/shell voxels -> %d kept (threshold=%d); spatial max @ %s retained",
                 sim_label, cube_voxel_count,
-                sum(1 for k in trimmed if k.startswith("cube_")),
+                sum(1 for k in trimmed if k.startswith("cube_") or k.startswith("shell_")),
                 SIDECAR_MAX_VOXELS, keep_name,
             )
             result["sensors"] = trimmed
