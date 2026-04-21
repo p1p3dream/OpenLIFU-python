@@ -63,6 +63,18 @@ from scipy.ndimage import map_coordinates
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# Load the standalone per-voxel water-gate helpers by path. The helper module
+# documents this importlib pattern; we use it to avoid requiring scripts/ on
+# sys.path and to keep the helper a standalone file (no package deps).
+import importlib.util as _ilu
+_helper_spec = _ilu.spec_from_file_location(
+    "_probe_helpers",
+    os.path.join(os.path.dirname(__file__), "_probe_helpers.py"),
+)
+_probe_helpers = _ilu.module_from_spec(_helper_spec)
+_helper_spec.loader.exec_module(_probe_helpers)
+per_voxel_water_calibrated_gate_center = _probe_helpers.per_voxel_water_calibrated_gate_center
+
 from openlifu.bf.delay_methods.direct import Direct
 from openlifu.bf.delay_methods.simulation_corrected import SimulationCorrected
 from openlifu.geo import Point
@@ -106,6 +118,12 @@ EXPANDED_TARGET_PROBE = os.environ.get("EXPANDED_TARGET_PROBE", "") == "1"
 # Half-extent of the cube (mm) around target when EXPANDED_TARGET_PROBE=1.
 # At 0.5 mm grid spacing, 5 mm half-extent -> 11x11x11 = 1331 voxels.
 EXPANDED_TARGET_HALF_MM = float(os.environ.get("EXPANDED_TARGET_HALF_MM", "5.0"))
+# Escape hatch: if set to "1", cube voxels reuse the SINGLE target-centered
+# water gate (legacy behavior). When unset/0 (default), cube voxels use a
+# per-voxel water-calibrated gate per Codex's recipe:
+#     t_gate(v) = t_water_peak(target) + (|aperture - v| - |aperture - target|) / c0
+# The legacy mode is retained for A/B comparison against the new metric.
+USE_TARGET_GATE_FOR_CUBE = os.environ.get("USE_TARGET_GATE_FOR_CUBE", "") == "1"
 
 
 def _default_fullhead_materials() -> dict[str, Material]:
@@ -560,14 +578,33 @@ def _run_timegated_probe(
                 p_fw_geom = float(p_abs[in_win].max()) if in_win.any() else float("nan")
 
                 # Water-calibrated gate:
-                #   - For the target sensor (original behavior).
-                #   - For cube_* sensors (NEW): use the same water gate center
-                #     so the spatial search measures what arrives in the SAME
-                #     time window as the target peak in water.
+                #   - For the target sensor: use the target water-peak time directly.
+                #   - For cube_* sensors (NEW, default): use a per-voxel
+                #     water-calibrated gate center that accounts for the
+                #     geometric TOF difference between the voxel and target:
+                #         t_gate(v) = t_water_peak(target)
+                #                   + (|aperture - v| - |aperture - target|) / c0
+                #     Without this correction, voxels far from target are
+                #     scored by random scatter arriving in the target's gate
+                #     rather than by focal-arrival energy, which produced
+                #     monotonic offset drift toward the cube face in the
+                #     GU010 spatial sweep (5/10/15/20/25 mm half-extent).
+                #   - Escape hatch USE_TARGET_GATE_FOR_CUBE=1 reverts to the
+                #     old single-gate behavior for A/B comparison.
                 p_fw_water = float("nan")
                 if target_gate_center_s is not None and (name == "target" or is_cube):
-                    t_lo_w = target_gate_center_s - 2.0 * pulse_dur
-                    t_hi_w = target_gate_center_s + 2.0 * pulse_dur
+                    if is_cube and not USE_TARGET_GATE_FOR_CUBE:
+                        gate_center_s = per_voxel_water_calibrated_gate_center(
+                            sensor_world_mm=actual,
+                            target_world_mm=target_mm,
+                            aperture_center_world_mm=aperture_center_mm,
+                            t_water_peak_target=float(target_gate_center_s),
+                            c0_mps=C0,
+                        )
+                    else:
+                        gate_center_s = float(target_gate_center_s)
+                    t_lo_w = gate_center_s - 2.0 * pulse_dur
+                    t_hi_w = gate_center_s + 2.0 * pulse_dur
                     in_win_w = (t_axis >= t_lo_w) & (t_axis <= t_hi_w)
                     p_fw_water = float(p_abs[in_win_w].max()) if in_win_w.any() else float("nan")
 
@@ -600,6 +637,11 @@ def _run_timegated_probe(
             "target_gate_center_s": target_gate_center_s,
             "expanded_target_probe": bool(EXPANDED_TARGET_PROBE),
             "cube_half_extent_mm": float(EXPANDED_TARGET_HALF_MM) if EXPANDED_TARGET_PROBE else None,
+            "cube_gate_mode": (
+                "per_voxel_water_calibrated"
+                if (target_gate_center_s is not None and not USE_TARGET_GATE_FOR_CUBE)
+                else ("single_target_water_gate" if target_gate_center_s is not None else "geometric_only")
+            ),
         }
         tgt = per_sensor.get("target", {})
         result["p_focal_window_at_target_Pa"] = tgt.get("p_focal_window_Pa", float("nan"))
