@@ -56,7 +56,10 @@ from scipy.ndimage import map_coordinates
 
 # Ensure local openlifu is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# Ensure sibling script module (_gpu_flock) is importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from _gpu_flock import gpu_flock
 from openlifu.bf.apod_methods.skull_incidence import SkullIncidenceApodization
 from openlifu.bf.delay_methods.complex_weighted import ComplexWeighted
 from openlifu.bf.delay_methods.direct import Direct
@@ -500,7 +503,8 @@ def _run_sparse_sensor_sim(
         int(xyz_sensor_indices.shape[0]), ref_values_only,
     )
     try:
-        output = kspaceFirstOrder3D(**deepcopy(inputs))
+        with gpu_flock():
+            output = kspaceFirstOrder3D(**deepcopy(inputs))
     finally:
         for fpath in [simulation_options.input_filename, simulation_options.output_filename]:
             with contextlib.suppress(OSError):
@@ -1005,9 +1009,10 @@ def main():
         print("\n[8] ComplexWeighted (narrowband complex weights)...")
         delay_method = ComplexWeighted(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
         t0 = time.time()
-        delays_corrected, apod_cw = delay_method.calc_delays_and_apod(
-            arr, target, sim_params, transform=None,
-        )
+        with gpu_flock():
+            delays_corrected, apod_cw = delay_method.calc_delays_and_apod(
+                arr, target, sim_params, transform=None,
+            )
         print(f"    ComplexWeighted done in {time.time()-t0:.1f}s")
         delays_corrected = np.asarray(delays_corrected, dtype=float)
         apod_cw = np.asarray(apod_cw, dtype=float) if apod_cw is not None else None
@@ -1080,7 +1085,8 @@ def main():
         print("\n[8] SimulationCorrected (phase correction)...")
         sim_corrected = SimulationCorrected(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
         t0 = time.time()
-        delays_corrected = sim_corrected.calc_delays(arr, target, sim_params)
+        with gpu_flock():
+            delays_corrected = sim_corrected.calc_delays(arr, target, sim_params)
         print(f"    Phase correction done in {time.time()-t0:.1f}s")
 
     # -------------------------------------------------------------------
@@ -1179,7 +1185,8 @@ def main():
     print("[SIM A] Phase-corrected + heterogeneous skull (nnU-Net)")
     print("=" * 72)
     t0 = time.time()
-    result_a = run_simulation(params=sim_params, delays=delays_corrected, ref_values_only=False, **common_kwargs)
+    with gpu_flock():
+        result_a = run_simulation(params=sim_params, delays=delays_corrected, ref_values_only=False, **common_kwargs)
     print(f"    Completed in {time.time()-t0:.1f}s")
     stats_a = extract_focal_stats(result_a, target_mm, "SIM A (corrected+hetero)", element_positions_mm=positions)
     masked_a_20 = extract_masked_argmax(result_a, target_mm, positions, 20.0)
@@ -1194,7 +1201,8 @@ def main():
     print("[SIM B] Geometric + heterogeneous skull (nnU-Net)")
     print("=" * 72)
     t0 = time.time()
-    result_b = run_simulation(params=sim_params, delays=delays_geo, ref_values_only=False, **common_kwargs)
+    with gpu_flock():
+        result_b = run_simulation(params=sim_params, delays=delays_geo, ref_values_only=False, **common_kwargs)
     print(f"    Completed in {time.time()-t0:.1f}s")
     stats_b = extract_focal_stats(result_b, target_mm, "SIM B (geometric+hetero)", element_positions_mm=positions)
     masked_b_20 = extract_masked_argmax(result_b, target_mm, positions, 20.0)
@@ -1209,7 +1217,8 @@ def main():
     print("[SIM C] Geometric + homogeneous water (ref_values_only)")
     print("=" * 72)
     t0 = time.time()
-    result_c = run_simulation(params=sim_params, delays=delays_geo, ref_values_only=True, **common_kwargs)
+    with gpu_flock():
+        result_c = run_simulation(params=sim_params, delays=delays_geo, ref_values_only=True, **common_kwargs)
     print(f"    Completed in {time.time()-t0:.1f}s")
     stats_c = extract_focal_stats(result_c, target_mm, "SIM C (geometric+water)", element_positions_mm=positions)
     masked_c_20 = extract_masked_argmax(result_c, target_mm, positions, 20.0)

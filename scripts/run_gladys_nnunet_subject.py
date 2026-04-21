@@ -75,6 +75,15 @@ _probe_helpers = _ilu.module_from_spec(_helper_spec)
 _helper_spec.loader.exec_module(_probe_helpers)
 per_voxel_water_calibrated_gate_center = _probe_helpers.per_voxel_water_calibrated_gate_center
 
+# Load _gpu_flock the same way (standalone script module, no package deps).
+_gpu_flock_spec = _ilu.spec_from_file_location(
+    "_gpu_flock",
+    os.path.join(os.path.dirname(__file__), "_gpu_flock.py"),
+)
+_gpu_flock_mod = _ilu.module_from_spec(_gpu_flock_spec)
+_gpu_flock_spec.loader.exec_module(_gpu_flock_mod)
+gpu_flock = _gpu_flock_mod.gpu_flock
+
 from openlifu.bf.delay_methods.complex_weighted import ComplexWeighted
 from openlifu.bf.delay_methods.direct import Direct
 from openlifu.bf.delay_methods.simulation_corrected import SimulationCorrected
@@ -138,6 +147,20 @@ SIDECAR_MAX_VOXELS: int | None = int(_sidecar_cap_raw) if _sidecar_cap_raw else 
 # available RAM. Center voxel (ix=iy=iz=0) is always included since 0 % s == 0.
 _stride_raw = os.environ.get("CUBE_PROBE_STRIDE", "1").strip()
 CUBE_PROBE_STRIDE: int = max(1, int(_stride_raw)) if _stride_raw else 1
+
+# Delay method selector. Mirrors run_gladys_nnunet.py. "simulation_corrected"
+# (default) preserves previous behavior. "complex_weighted" swaps in
+# ComplexWeighted (narrowband complex weights) which returns (delays, apod)
+# via calc_delays_and_apod; the returned apod is multiplied into the
+# (uniform) apod base.
+DELAY_METHOD = os.environ.get("DELAY_METHOD", "simulation_corrected").strip().lower()
+if DELAY_METHOD not in ("simulation_corrected", "complex_weighted"):
+    raise ValueError(
+        f"DELAY_METHOD must be 'simulation_corrected' or 'complex_weighted', got '{DELAY_METHOD}'"
+    )
+CW_NORM = os.environ.get("CW_NORM", "max").strip().lower()
+if CW_NORM not in ("max", "sum", "rms"):
+    raise ValueError(f"CW_NORM must be max/sum/rms, got '{CW_NORM}'")
 
 # --- Bounded-shell spatial probe ---------------------------------------------
 # When PROBE_SHELL_INNER_MM and PROBE_SHELL_OUTER_MM are both set (and outer
@@ -399,7 +422,8 @@ def _run_sparse_sensor_sim(
         int(xyz_sensor_indices.shape[0]), ref_values_only,
     )
     try:
-        output = kspaceFirstOrder3D(**deepcopy(inputs))
+        with gpu_flock():
+            output = kspaceFirstOrder3D(**deepcopy(inputs))
     finally:
         for fpath in [simulation_options.input_filename, simulation_options.output_filename]:
             with contextlib.suppress(OSError):
@@ -1055,10 +1079,96 @@ def main():
     dx_m = GRID_SPACING_MM * 1e-3
     dt = CFL * dx_m / c_max
 
-    sim_corrected = SimulationCorrected(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
-    delays_corrected = sim_corrected.calc_delays(arr, target, sim_params)
+    apod_cw: np.ndarray | None = None
+    cw_apod_info: dict | None = None
+    if DELAY_METHOD == "complex_weighted":
+        print("\n[8] ComplexWeighted (narrowband complex weights)...")
+        delay_method = ComplexWeighted(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
+        t0 = time.time()
+        with gpu_flock():
+            delays_corrected, apod_cw = delay_method.calc_delays_and_apod(
+                arr, target, sim_params, transform=None,
+            )
+        print(f"    ComplexWeighted done in {time.time()-t0:.1f}s")
+        delays_corrected = np.asarray(delays_corrected, dtype=float)
+        apod_cw = np.asarray(apod_cw, dtype=float) if apod_cw is not None else None
+        if apod_cw is not None:
+            apod_cw_pre = apod_cw.copy()
+            if CW_NORM == "max":
+                pass  # already max-normalized so max(apod) == 1
+            elif CW_NORM == "sum":
+                s = float(apod_cw.sum())
+                if s > 0:
+                    apod_cw = apod_cw * (len(apod_cw) / s)
+            elif CW_NORM == "rms":
+                current_sumsq = float(np.sum(apod_cw ** 2))
+                if current_sumsq > 0:
+                    apod_cw = apod_cw * np.sqrt(len(apod_cw) / current_sumsq)
+            print(
+                f"    CW_NORM={CW_NORM}: pre-norm sum={apod_cw_pre.sum():.3f}, "
+                f"max={apod_cw_pre.max():.4f}; "
+                f"post-norm sum={apod_cw.sum():.3f}, max={apod_cw.max():.4f}"
+            )
+            n_hot = int((apod_cw > 2.0).sum())
+            if n_hot > 0:
+                print(
+                    f"    WARNING: {n_hot} element(s) have apod > 2.0 after "
+                    f"CW_NORM={CW_NORM} (max={apod_cw.max():.3f}); not clamping."
+                )
+            thr = 0.01
+            n_total_cw = int(apod_cw.size)
+            n_active_cw = int((apod_cw > thr).sum())
+            frac_above = n_active_cw / n_total_cw if n_total_cw > 0 else 0.0
+            print(
+                f"    CW apod stats: min={apod_cw.min():.4f}, max={apod_cw.max():.4f}, "
+                f"mean={apod_cw.mean():.4f}, std={apod_cw.std():.4f}"
+            )
+            print(
+                f"    CW apod active (> {thr}): {n_active_cw}/{n_total_cw} "
+                f"(fraction={frac_above:.3f})"
+            )
+            cw_apod_info = {
+                "cw_norm": CW_NORM,
+                "min": float(apod_cw.min()),
+                "max": float(apod_cw.max()),
+                "mean": float(apod_cw.mean()),
+                "std": float(apod_cw.std()),
+                "apod_max": float(apod_cw.max()),
+                "apod_sum": float(apod_cw.sum()),
+                "pre_norm_max": float(apod_cw_pre.max()),
+                "pre_norm_sum": float(apod_cw_pre.sum()),
+                "threshold": thr,
+                "n_active": n_active_cw,
+                "n_total": n_total_cw,
+                "n_hot_above_2": n_hot,
+                "fraction_above_threshold": frac_above,
+                "weights": apod_cw.tolist(),
+            }
+        else:
+            print("    CW returned apod=None; treating as uniform amplitude.")
+        print(
+            f"    Delay range (corrected): {delays_corrected.min()*1e6:.2f} to "
+            f"{delays_corrected.max()*1e6:.2f} us  (min>=0 enforced)"
+        )
+    else:
+        print("\n[8] SimulationCorrected (phase correction)...")
+        sim_corrected = SimulationCorrected(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
+        t0 = time.time()
+        with gpu_flock():
+            delays_corrected = sim_corrected.calc_delays(arr, target, sim_params)
+        print(f"    Phase correction done in {time.time()-t0:.1f}s")
 
     apod = np.ones(arr.numelements())
+    if apod_cw is not None:
+        if apod_cw.shape != apod.shape:
+            raise ValueError(
+                f"apod_cw shape {apod_cw.shape} does not match apod shape {apod.shape}"
+            )
+        apod = np.asarray(apod, dtype=float) * np.asarray(apod_cw, dtype=float)
+        print(
+            f"    Combined apod after CW: min={apod.min():.4f}, max={apod.max():.4f}, "
+            f"mean={apod.mean():.4f}, sum={apod.sum():.2f}"
+        )
     common_kwargs = dict(
         arr=arr, apod=apod, freq=FREQ_HZ, cycles=CYCLES, amplitude=AMPLITUDE,
         dt=dt, t_end=t_end, cfl=CFL, gpu=True, source_method="point_source",
@@ -1070,8 +1180,9 @@ def main():
     # -------------------------------------------------------------------
     print("\n[SIM C] geometric + water  (run FIRST for gate calibration)")
     t0 = time.time()
-    result_c = run_simulation(params=sim_params, delays=delays_geo,
-                              ref_values_only=True, **common_kwargs)
+    with gpu_flock():
+        result_c = run_simulation(params=sim_params, delays=delays_geo,
+                                  ref_values_only=True, **common_kwargs)
     print(f"  done in {time.time()-t0:.1f}s")
     probe_c = _run_timegated_probe(
         arr=arr, params=sim_params, delays=delays_geo, apod=apod,
@@ -1096,8 +1207,9 @@ def main():
 
     print("\n[SIM A] corrected + skull (nnU-Net)")
     t0 = time.time()
-    result_a = run_simulation(params=sim_params, delays=delays_corrected,
-                              ref_values_only=False, **common_kwargs)
+    with gpu_flock():
+        result_a = run_simulation(params=sim_params, delays=delays_corrected,
+                                  ref_values_only=False, **common_kwargs)
     print(f"  done in {time.time()-t0:.1f}s")
     probe_a = _run_timegated_probe(
         arr=arr, params=sim_params, delays=delays_corrected, apod=apod,
@@ -1109,8 +1221,9 @@ def main():
 
     print("\n[SIM B] geometric + skull")
     t0 = time.time()
-    result_b = run_simulation(params=sim_params, delays=delays_geo,
-                              ref_values_only=False, **common_kwargs)
+    with gpu_flock():
+        result_b = run_simulation(params=sim_params, delays=delays_geo,
+                                  ref_values_only=False, **common_kwargs)
     print(f"  done in {time.time()-t0:.1f}s")
     probe_b = _run_timegated_probe(
         arr=arr, params=sim_params, delays=delays_geo, apod=apod,
