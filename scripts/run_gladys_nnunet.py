@@ -57,6 +57,8 @@ from scipy.ndimage import map_coordinates
 # Ensure local openlifu is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from openlifu.bf.apod_methods.skull_incidence import SkullIncidenceApodization
+from openlifu.bf.delay_methods.complex_weighted import ComplexWeighted
 from openlifu.bf.delay_methods.direct import Direct
 from openlifu.bf.delay_methods.simulation_corrected import SimulationCorrected
 from openlifu.geo import Point
@@ -108,6 +110,24 @@ GRID_MARGIN_MM = 10.0
 # without editing this file. If the extra k-wave call fails for any reason the
 # probe is skipped with a warning and the main pipeline continues.
 ENABLE_TIMEGATED_PROBE = os.environ.get("OPENLIFU_DISABLE_TIMEGATED_PROBE", "") != "1"
+
+# Opt-in apodization mode: down-weight elements whose rays strike the skull
+# near-perpendicular. Off by default (uniform apod).
+SKULL_INCIDENCE_APOD = os.environ.get("SKULL_INCIDENCE_APOD", "") == "1"
+SKULL_APOD_MIN_ANGLE_DEG = float(os.environ.get("SKULL_APOD_MIN_ANGLE_DEG", "20.0"))
+SKULL_APOD_ROLLOFF_ANGLE_DEG = float(os.environ.get("SKULL_APOD_ROLLOFF_ANGLE_DEG", "45.0"))
+APOD_INFIX = "_skullapod" if SKULL_INCIDENCE_APOD else ""
+
+# Delay method selector. "simulation_corrected" (default) preserves current
+# behavior. "complex_weighted" swaps in ComplexWeighted (narrowband complex
+# weights), which returns (delays, apod) via calc_delays_and_apod; the
+# returned apod is multiplied into the existing (usually uniform) apod.
+DELAY_METHOD = os.environ.get("DELAY_METHOD", "simulation_corrected").strip().lower()
+if DELAY_METHOD not in ("simulation_corrected", "complex_weighted"):
+    raise ValueError(
+        f"DELAY_METHOD must be 'simulation_corrected' or 'complex_weighted', got '{DELAY_METHOD}'"
+    )
+DELAY_INFIX = "_cw" if DELAY_METHOD == "complex_weighted" else ""
 
 
 # ---------------------------------------------------------------------------
@@ -979,13 +999,174 @@ def main():
     n_timesteps = int(np.ceil(t_end / dt))
     print(f"    Max element->corner: {max_dist_mm:.1f} mm | t_end={t_end*1e6:.1f} us | dt={dt*1e9:.2f} ns | N={n_timesteps:,d}")
 
-    print("\n[8] SimulationCorrected (phase correction)...")
-    sim_corrected = SimulationCorrected(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
-    t0 = time.time()
-    delays_corrected = sim_corrected.calc_delays(arr, target, sim_params)
-    print(f"    Phase correction done in {time.time()-t0:.1f}s")
+    apod_cw: np.ndarray | None = None
+    cw_apod_info: dict | None = None
+    if DELAY_METHOD == "complex_weighted":
+        print("\n[8] ComplexWeighted (narrowband complex weights)...")
+        delay_method = ComplexWeighted(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
+        t0 = time.time()
+        delays_corrected, apod_cw = delay_method.calc_delays_and_apod(
+            arr, target, sim_params, transform=None,
+        )
+        print(f"    ComplexWeighted done in {time.time()-t0:.1f}s")
+        delays_corrected = np.asarray(delays_corrected, dtype=float)
+        apod_cw = np.asarray(apod_cw, dtype=float) if apod_cw is not None else None
+        if apod_cw is not None:
+            # CW_NORM selects how the per-element amplitude weights are
+            # normalized. ComplexWeighted returns apod with max(apod)==1,
+            # which discards aperture-sum power. "sum" preserves total
+            # radiated power (sum(apod)==N); "rms" preserves radiated
+            # intensity (sum(apod^2)==N). Default is "max" for backward
+            # compatibility.
+            cw_norm = os.environ.get("CW_NORM", "max").lower()
+            apod_cw_pre = apod_cw.copy()
+            if cw_norm == "max":
+                pass  # already normalized so max(apod) == 1
+            elif cw_norm == "sum":
+                s = float(apod_cw.sum())
+                if s > 0:
+                    apod_cw = apod_cw * (len(apod_cw) / s)
+            elif cw_norm == "rms":
+                current_sumsq = float(np.sum(apod_cw ** 2))
+                if current_sumsq > 0:
+                    apod_cw = apod_cw * np.sqrt(len(apod_cw) / current_sumsq)
+            else:
+                raise ValueError(f"CW_NORM must be max/sum/rms, got {cw_norm}")
+            print(
+                f"    CW_NORM={cw_norm}: pre-norm sum={apod_cw_pre.sum():.3f}, "
+                f"max={apod_cw_pre.max():.4f}; "
+                f"post-norm sum={apod_cw.sum():.3f}, max={apod_cw.max():.4f}"
+            )
+            n_hot = int((apod_cw > 2.0).sum())
+            if n_hot > 0:
+                print(
+                    f"    WARNING: {n_hot} element(s) have apod > 2.0 after "
+                    f"CW_NORM={cw_norm} (max={apod_cw.max():.3f}); not clamping."
+                )
+            thr = 0.01
+            n_total = int(apod_cw.size)
+            n_active = int((apod_cw > thr).sum())
+            frac_above = n_active / n_total if n_total > 0 else 0.0
+            print(
+                f"    CW apod stats: min={apod_cw.min():.4f}, max={apod_cw.max():.4f}, "
+                f"mean={apod_cw.mean():.4f}, std={apod_cw.std():.4f}"
+            )
+            print(
+                f"    CW apod active (> {thr}): {n_active}/{n_total} "
+                f"(fraction={frac_above:.3f})"
+            )
+            cw_apod_info = {
+                "cw_norm": cw_norm,
+                "min": float(apod_cw.min()),
+                "max": float(apod_cw.max()),
+                "mean": float(apod_cw.mean()),
+                "std": float(apod_cw.std()),
+                "apod_max": float(apod_cw.max()),
+                "apod_sum": float(apod_cw.sum()),
+                "pre_norm_max": float(apod_cw_pre.max()),
+                "pre_norm_sum": float(apod_cw_pre.sum()),
+                "threshold": thr,
+                "n_active": n_active,
+                "n_total": n_total,
+                "n_hot_above_2": n_hot,
+                "fraction_above_threshold": frac_above,
+                "weights": apod_cw.tolist(),
+            }
+        else:
+            print("    CW returned apod=None; treating as uniform amplitude.")
+        print(f"    Delay range (corrected): {delays_corrected.min()*1e6:.2f} to "
+              f"{delays_corrected.max()*1e6:.2f} us  (min>=0 enforced)")
+    else:
+        print("\n[8] SimulationCorrected (phase correction)...")
+        sim_corrected = SimulationCorrected(c0=C0, cfl=CFL, n_cycles=3, gpu=True)
+        t0 = time.time()
+        delays_corrected = sim_corrected.calc_delays(arr, target, sim_params)
+        print(f"    Phase correction done in {time.time()-t0:.1f}s")
 
-    apod = np.ones(arr.numelements())
+    # -------------------------------------------------------------------
+    # 8b. Apodization: uniform (default) or SkullIncidenceApodization.
+    # -------------------------------------------------------------------
+    apod_info: dict = {"mode": "uniform"}
+    if SKULL_INCIDENCE_APOD:
+        print("\n[8b] Computing SkullIncidenceApodization weights "
+              f"(min_angle={SKULL_APOD_MIN_ANGLE_DEG} deg, "
+              f"rolloff={SKULL_APOD_ROLLOFF_ANGLE_DEG} deg)...")
+        # Build a skull mask DataArray matching the sim grid. sim_seg is
+        # already an xa.DataArray on the sim grid with mm coords; derive a
+        # boolean/uint8 mask and preserve its dims+coords.
+        skull_mask_xa = xa.DataArray(
+            (sim_seg.to_numpy() == material_idx["skull"]).astype(np.uint8),
+            dims=sim_seg.dims,
+            coords={d: sim_seg.coords[d] for d in sim_seg.dims},
+        )
+        print(f"    Skull-mask voxels: {int(skull_mask_xa.sum())} "
+              f"({100.0 * float(skull_mask_xa.mean()):.2f}% of sim grid)")
+        apod_method = SkullIncidenceApodization(
+            skull_mask=skull_mask_xa,
+            min_angle_deg=SKULL_APOD_MIN_ANGLE_DEG,
+            rolloff_angle_deg=SKULL_APOD_ROLLOFF_ANGLE_DEG,
+        )
+        t0 = time.time()
+        # Elements have world positions pre-baked above; pass transform=None.
+        apod = np.asarray(
+            apod_method.calc_apodization(arr, target, sim_params, transform=None),
+            dtype=float,
+        )
+        print(f"    apod computed in {time.time()-t0:.1f}s")
+        n_total = int(apod.size)
+        n_zero = int((apod <= 0.0).sum())
+        n_full = int((apod >= 1.0).sum())
+        n_partial = int(((apod > 0.0) & (apod < 1.0)).sum())
+        n_active = n_total - n_zero
+        print(f"    Elements: active={n_active}/{n_total}, "
+              f"full={n_full}, partial={n_partial}, zero={n_zero}")
+        print(f"    apod stats: min={apod.min():.3f}, max={apod.max():.3f}, "
+              f"mean={apod.mean():.3f}, sum={apod.sum():.2f}")
+        apod_info = {
+            "mode": "skull_incidence",
+            "min_angle_deg": SKULL_APOD_MIN_ANGLE_DEG,
+            "rolloff_angle_deg": SKULL_APOD_ROLLOFF_ANGLE_DEG,
+            "n_total": n_total,
+            "n_active": n_active,
+            "n_full": n_full,
+            "n_partial": n_partial,
+            "n_zero": n_zero,
+            "weights": apod.tolist(),
+            "apod_sum": float(apod.sum()),
+        }
+    else:
+        apod = np.ones(arr.numelements())
+        apod_info = {
+            "mode": "uniform",
+            "n_total": int(apod.size),
+            "n_active": int(apod.size),
+            "n_full": int(apod.size),
+            "n_partial": 0,
+            "n_zero": 0,
+            "weights": apod.tolist(),
+            "apod_sum": float(apod.sum()),
+        }
+
+    # Fold in ComplexWeighted per-element amplitude if applicable. The
+    # existing apod above is either uniform or skull-incidence; CW amplitude
+    # stacks on top as a simple element-wise multiplication.
+    if apod_cw is not None:
+        if apod_cw.shape != apod.shape:
+            raise ValueError(
+                f"apod_cw shape {apod_cw.shape} does not match apod shape {apod.shape}"
+            )
+        apod = np.asarray(apod, dtype=float) * np.asarray(apod_cw, dtype=float)
+        apod_info["cw_apod"] = cw_apod_info
+        apod_info["mode"] = (
+            f"{apod_info.get('mode', 'uniform')}+complex_weighted"
+        )
+        apod_info["weights"] = apod.tolist()
+        apod_info["apod_sum"] = float(apod.sum())
+        print(
+            f"    Combined apod after CW: min={apod.min():.4f}, max={apod.max():.4f}, "
+            f"mean={apod.mean():.4f}, sum={apod.sum():.2f}"
+        )
+
     common_kwargs = dict(
         arr=arr, apod=apod, freq=FREQ_HZ, cycles=CYCLES, amplitude=AMPLITUDE,
         dt=dt, t_end=t_end, cfl=CFL, gpu=True, source_method="point_source",
@@ -1121,13 +1302,20 @@ def main():
         out_affine[0, 3] = float(x_coords[0])
         out_affine[1, 3] = float(y_coords[0])
         out_affine[2, 3] = float(z_coords[0])
-        out_path = results_dir / f"gladys_nnunet_{sim_label}_pmax.nii.gz"
+        out_path = results_dir / f"gladys_nnunet{APOD_INFIX}{DELAY_INFIX}_{sim_label}_pmax.nii.gz"
         nib.save(nib.Nifti1Image(p_max_data.astype(np.float32), out_affine), str(out_path))
         print(f"    Saved: {out_path}")
 
         # Time-gated sidecar JSON with raw time series + metrics.
-        sidecar_path = results_dir / f"gladys_nnunet_{sim_label}_timegated.json"
-        _save_timegated_json(probe, sidecar_path)
+        # Always write a sidecar (even if the probe failed) so the apod
+        # metadata and weights are captured for later analysis.
+        sidecar_path = results_dir / f"gladys_nnunet{APOD_INFIX}{DELAY_INFIX}_{sim_label}_timegated.json"
+        probe_out = dict(probe) if probe is not None else {
+            "sim_label": sim_label,
+            "probe_failed": True,
+        }
+        probe_out["apod_info"] = apod_info
+        _save_timegated_json(probe_out, sidecar_path)
 
     # -------------------------------------------------------------------
     # 14. Plot: 2D slice + axial profile per sim
@@ -1140,7 +1328,7 @@ def main():
     # the axis with smallest skull extent (typically y for an axial head scan).
     # For simplicity: take slice at target index along the axis with minimum
     # extent among the two non-approach axes.
-    plot_path = results_dir / "gladys_nnunet_pmax_analysis_2026-04-18.png"
+    plot_path = results_dir / f"gladys_nnunet{APOD_INFIX}{DELAY_INFIX}_pmax_analysis_2026-04-18.png"
 
     sim_x = np.asarray(sim_coord_arrays[0])
     sim_y = np.asarray(sim_coord_arrays[1])
