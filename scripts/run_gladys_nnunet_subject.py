@@ -102,6 +102,10 @@ GRID_MARGIN_MM = 10.0
 APERTURE_BAND_RADIUS_MM = 10.0
 
 ENABLE_TIMEGATED_PROBE = os.environ.get("OPENLIFU_DISABLE_TIMEGATED_PROBE", "") != "1"
+EXPANDED_TARGET_PROBE = os.environ.get("EXPANDED_TARGET_PROBE", "") == "1"
+# Half-extent of the cube (mm) around target when EXPANDED_TARGET_PROBE=1.
+# At 0.5 mm grid spacing, 5 mm half-extent -> 11x11x11 = 1331 voxels.
+EXPANDED_TARGET_HALF_MM = float(os.environ.get("EXPANDED_TARGET_HALF_MM", "5.0"))
 
 
 def _default_fullhead_materials() -> dict[str, Material]:
@@ -356,6 +360,8 @@ def _build_sensor_mask(
     params: xa.Dataset,
     target_mm: np.ndarray,
     aperture_center_mm: np.ndarray,
+    expanded_target_cube: bool = False,
+    cube_half_mm: float = 5.0,
 ) -> tuple[np.ndarray, list[str], list[tuple[int, int, int]], list[np.ndarray]]:
     axis_vec = aperture_center_mm - target_mm
     axis_len = float(np.linalg.norm(axis_vec))
@@ -375,13 +381,47 @@ def _build_sensor_mask(
     if perp is None:
         perp = np.array([1.0, 0.0, 0.0])
 
-    sensor_world_mm = [
+    sensor_world_mm: list[tuple[str, np.ndarray]] = [
         ("target",        target_mm.copy()),
         ("aperture_ctr",  aperture_center_mm.copy()),
         ("midway",        target_mm + 0.5 * axis_vec),
         ("quarterway",    target_mm + 0.75 * axis_vec),
         ("off_axis_15mm", target_mm + 15.0 * perp),
     ]
+
+    # Optionally add a cube of sensors centered on target.
+    if expanded_target_cube:
+        # Figure out grid spacing along each axis from params
+        sim_dim_names = list(params.dims)
+        sim_coord_params = {d: params.coords[d].to_numpy() for d in sim_dim_names}
+        # Use x,y,z direct (not sim-dim order) for cube construction
+        cx = params.coords["x"].to_numpy()
+        cy = params.coords["y"].to_numpy()
+        cz = params.coords["z"].to_numpy()
+        dx = float(cx[1] - cx[0]) if len(cx) > 1 else 0.5
+        dy = float(cy[1] - cy[0]) if len(cy) > 1 else 0.5
+        dz = float(cz[1] - cz[0]) if len(cz) > 1 else 0.5
+
+        def _steps(d):
+            return int(round(cube_half_mm / abs(d)))
+
+        nx, ny, nz_ = _steps(dx), _steps(dy), _steps(dz)
+        existing_positions = {tuple(np.round(pos, 6)) for _, pos in sensor_world_mm}
+        for ix in range(-nx, nx + 1):
+            for iy in range(-ny, ny + 1):
+                for iz in range(-nz_, nz_ + 1):
+                    if ix == 0 and iy == 0 and iz == 0:
+                        continue  # target already present
+                    pos = np.array([
+                        target_mm[0] + ix * dx,
+                        target_mm[1] + iy * dy,
+                        target_mm[2] + iz * dz,
+                    ])
+                    key = tuple(np.round(pos, 6))
+                    if key in existing_positions:
+                        continue
+                    existing_positions.add(key)
+                    sensor_world_mm.append((f"cube_{ix:+d}_{iy:+d}_{iz:+d}", pos))
 
     sim_dim_names = list(params.dims)
     sim_coord_params = {d: params.coords[d].to_numpy() for d in sim_dim_names}
@@ -390,6 +430,7 @@ def _build_sensor_mask(
     names: list[str] = []
     xyz_idx_list: list[tuple[int, int, int]] = []
     actual_list: list[np.ndarray] = []
+    seen_xyz: set[tuple[int, int, int]] = set()
     for name, pos_mm in sensor_world_mm:
         idx_in_params: list[int] = []
         idx_in_xyz = [0, 0, 0]
@@ -402,9 +443,14 @@ def _build_sensor_mask(
             idx_in_params.append(i)
             idx_in_xyz[xyz_ax] = i
             actual[xyz_ax] = float(cv[i])
+        xyz_tuple = tuple(idx_in_xyz)
+        if xyz_tuple in seen_xyz:
+            # Skip duplicates caused by grid snapping (e.g., two cube voxels colliding)
+            continue
+        seen_xyz.add(xyz_tuple)
         mask[tuple(idx_in_params)] = 1
         names.append(name)
-        xyz_idx_list.append(tuple(idx_in_xyz))
+        xyz_idx_list.append(xyz_tuple)
         actual_list.append(actual)
     return mask, names, xyz_idx_list, actual_list
 
@@ -434,6 +480,8 @@ def _run_timegated_probe(
     try:
         mask, names, xyz_idx_list, actual_list = _build_sensor_mask(
             params, target_mm, aperture_center_mm,
+            expanded_target_cube=EXPANDED_TARGET_PROBE,
+            cube_half_mm=EXPANDED_TARGET_HALF_MM,
         )
         probe_kwargs = dict(common_kwargs)
         probe_kwargs.pop("arr", None)
@@ -469,7 +517,13 @@ def _run_timegated_probe(
             return int(matches[0]) if len(matches) else None
 
         per_sensor = {}
+        # Named sensors get full detail (including time series). Cube sensors
+        # only get summary scalars, to keep sidecar size manageable.
+        named_sensors = {
+            "target", "aperture_ctr", "midway", "quarterway", "off_axis_15mm",
+        }
         for name, xyz_idx, actual in zip(names, xyz_idx_list, actual_list):
+            is_cube = name.startswith("cube_")
             col = _col_for(xyz_idx)
             d_m = float(np.linalg.norm(actual - aperture_center_mm)) * 1e-3
             tof_s = d_m / C0  # geometric TOF @ C0 (water speed)
@@ -489,24 +543,29 @@ def _run_timegated_probe(
                     "p_allt_Pa": float("nan"),
                     "ratio": float("nan"),
                     "peak_time_s": float("nan"),
-                    "p_t": [],
                     "note": "voxel collision; no dedicated column",
                 })
+                if not is_cube:
+                    rec["p_t"] = []
             else:
                 p_t = p_sensor[:, col]
                 p_abs = np.abs(p_t)
                 p_allt = float(p_abs.max())
                 peak_time_s = float(t_axis[int(np.argmax(p_abs))]) if Nt > 0 else float("nan")
 
-                # Geometric gate (existing metric)
+                # Geometric gate (existing metric) - per-sensor TOF
                 t_lo = tof_s - 2.0 * pulse_dur
                 t_hi = tof_s + 2.0 * pulse_dur
                 in_win = (t_axis >= t_lo) & (t_axis <= t_hi)
                 p_fw_geom = float(p_abs[in_win].max()) if in_win.any() else float("nan")
 
-                # Water-calibrated gate (only for target sensor, when provided)
+                # Water-calibrated gate:
+                #   - For the target sensor (original behavior).
+                #   - For cube_* sensors (NEW): use the same water gate center
+                #     so the spatial search measures what arrives in the SAME
+                #     time window as the target peak in water.
                 p_fw_water = float("nan")
-                if name == "target" and target_gate_center_s is not None:
+                if target_gate_center_s is not None and (name == "target" or is_cube):
                     t_lo_w = target_gate_center_s - 2.0 * pulse_dur
                     t_hi_w = target_gate_center_s + 2.0 * pulse_dur
                     in_win_w = (t_axis >= t_lo_w) & (t_axis <= t_hi_w)
@@ -520,9 +579,10 @@ def _run_timegated_probe(
                     "p_allt_Pa": p_allt,
                     "ratio": ratio,
                     "peak_time_s": peak_time_s,
-                    "p_t": p_t.astype(np.float32).tolist(),
                     "note": "",
                 })
+                if not is_cube:
+                    rec["p_t"] = p_t.astype(np.float32).tolist()
             per_sensor[name] = rec
 
         result = {
@@ -538,6 +598,8 @@ def _run_timegated_probe(
             "sensors": per_sensor,
             "probe_runtime_s": probe_secs,
             "target_gate_center_s": target_gate_center_s,
+            "expanded_target_probe": bool(EXPANDED_TARGET_PROBE),
+            "cube_half_extent_mm": float(EXPANDED_TARGET_HALF_MM) if EXPANDED_TARGET_PROBE else None,
         }
         tgt = per_sensor.get("target", {})
         result["p_focal_window_at_target_Pa"] = tgt.get("p_focal_window_Pa", float("nan"))
@@ -546,6 +608,43 @@ def _run_timegated_probe(
         result["ratio_at_target"] = tgt.get("ratio", float("nan"))
         result["target_peak_time_s"] = tgt.get("peak_time_s", float("nan"))
         result["target_tof_s"] = tgt.get("tof_s", float("nan"))
+
+        # --- Spatial search over target cube (+target itself) ----------------
+        # For skull sims (target_gate_center_s provided), use water-gate values.
+        # For the water sim (no gate center), use geometric-gate values.
+        use_water_gate_for_cube = target_gate_center_s is not None
+        cube_candidates = []
+        for s_name, s_rec in per_sensor.items():
+            if not (s_name == "target" or s_name.startswith("cube_")):
+                continue
+            if use_water_gate_for_cube:
+                val = s_rec.get("p_focal_window_water_gate_Pa", float("nan"))
+            else:
+                val = s_rec.get("p_focal_window_Pa", float("nan"))
+            if val is None or not np.isfinite(val):
+                continue
+            cube_candidates.append((s_name, float(val), s_rec.get("sensor_world_mm")))
+        result["cube_n_sensors"] = len(cube_candidates)
+        result["cube_uses_water_gate"] = bool(use_water_gate_for_cube)
+        if cube_candidates:
+            best_name, best_val, best_pos = max(cube_candidates, key=lambda t: t[1])
+            best_pos_arr = np.array(best_pos) if best_pos is not None else np.array([float("nan")] * 3)
+            offset = float(np.linalg.norm(best_pos_arr - target_mm)) if np.all(np.isfinite(best_pos_arr)) else float("nan")
+            result["spatial_max_sensor_name"] = best_name
+            result["spatial_max_world_mm"] = best_pos_arr.tolist()
+            result["spatial_max_offset_from_target_mm"] = offset
+            if use_water_gate_for_cube:
+                result["spatial_max_p_focal_window_water_gate_Pa"] = best_val
+                result["spatial_max_p_focal_window_Pa"] = float("nan")
+            else:
+                result["spatial_max_p_focal_window_Pa"] = best_val
+                result["spatial_max_p_focal_window_water_gate_Pa"] = float("nan")
+        else:
+            result["spatial_max_sensor_name"] = None
+            result["spatial_max_world_mm"] = None
+            result["spatial_max_offset_from_target_mm"] = float("nan")
+            result["spatial_max_p_focal_window_Pa"] = float("nan")
+            result["spatial_max_p_focal_window_water_gate_Pa"] = float("nan")
         return result
     except Exception as exc:
         logger.warning(
@@ -938,6 +1037,39 @@ def main():
         except Exception:
             return "nan"
 
+    # Spatial-search fields (NaN if not enabled)
+    sp_water_target = p_fw_geom_water  # baseline: water sim target, geom gate
+    sp_water_cube_max = (
+        probe_c.get("spatial_max_p_focal_window_Pa", float("nan"))
+        if probe_c else float("nan")
+    )
+    sp_corr_target = p_fw_water_skull_corr  # skull corrected, water gate, target
+    sp_corr_cube_max = (
+        probe_a.get("spatial_max_p_focal_window_water_gate_Pa", float("nan"))
+        if probe_a else float("nan")
+    )
+    sp_geom_target = p_fw_water_skull_geom
+    sp_geom_cube_max = (
+        probe_b.get("spatial_max_p_focal_window_water_gate_Pa", float("nan"))
+        if probe_b else float("nan")
+    )
+    sp_offset_corr = probe_a.get("spatial_max_offset_from_target_mm", float("nan")) if probe_a else float("nan")
+    sp_offset_geom = probe_b.get("spatial_max_offset_from_target_mm", float("nan")) if probe_b else float("nan")
+    sp_offset_water = probe_c.get("spatial_max_offset_from_target_mm", float("nan")) if probe_c else float("nan")
+
+    # Spatial-search attenuation: water baseline (use spatial max of water cube
+    # so we compare apples-to-apples: spatial-peak in water vs spatial-peak in skull)
+    atten_db_fw_water_sp_waterbase_target = _db(sp_corr_cube_max, sp_water_target)
+    atten_db_fw_water_sp_waterbase_cube = _db(sp_corr_cube_max, sp_water_cube_max)
+
+    print("\n--- SPATIAL-SEARCH METRICS ---")
+    print(f"  water    target  : {sp_water_target:.4g} Pa")
+    print(f"  water    cube-max: {sp_water_cube_max:.4g} Pa  (offset={sp_offset_water:.2f} mm)")
+    print(f"  skull C  target  : {sp_corr_target:.4g} Pa")
+    print(f"  skull C  cube-max: {sp_corr_cube_max:.4g} Pa  (offset={sp_offset_corr:.2f} mm)")
+    print(f"  atten vs water_target (cube-max skull C): {atten_db_fw_water_sp_waterbase_target:.2f} dB")
+    print(f"  atten vs water_cube   (cube-max skull C): {atten_db_fw_water_sp_waterbase_cube:.2f} dB")
+
     print(
         f"SUBJECT_SUMMARY subject={subj} "
         f"bone_pct={pct_skull:.3f} "
@@ -956,7 +1088,18 @@ def main():
         f"t_water_peak_us={_fmt(t_water_peak_s*1e6) if np.isfinite(t_water_peak_s) else 'nan'} "
         f"tof_geom_us={_fmt(tof_geom_s*1e6) if np.isfinite(tof_geom_s) else 'nan'} "
         f"atten_db_fw_geom={_fmt(atten_db_fw_geom)} "
-        f"atten_db_fw_water={_fmt(atten_db_fw_water)}"
+        f"atten_db_fw_water={_fmt(atten_db_fw_water)} "
+        f"sp_water_target={_fmt(sp_water_target)} "
+        f"sp_water_cube_max={_fmt(sp_water_cube_max)} "
+        f"sp_offset_water_mm={_fmt(sp_offset_water)} "
+        f"sp_corr_target={_fmt(sp_corr_target)} "
+        f"sp_corr_cube_max={_fmt(sp_corr_cube_max)} "
+        f"sp_offset_corr_mm={_fmt(sp_offset_corr)} "
+        f"sp_geom_target={_fmt(sp_geom_target)} "
+        f"sp_geom_cube_max={_fmt(sp_geom_cube_max)} "
+        f"sp_offset_geom_mm={_fmt(sp_offset_geom)} "
+        f"atten_db_sp_target_base={_fmt(atten_db_fw_water_sp_waterbase_target)} "
+        f"atten_db_sp_cube_base={_fmt(atten_db_fw_water_sp_waterbase_cube)}"
     )
 
 
