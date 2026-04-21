@@ -4,19 +4,33 @@
 Forked from run_gladys_nnunet.py (which was hardcoded to GU008). Adds:
   - --subject <SubjectID> flag to derive MRI + label paths
   - Inline focal-gain metric (p@target vs aperture-band mean) at 10 mm radius
+  - Time-gated probe (sparse sensor) with BOTH a geometric-gate and a
+    water-calibrated-gate p_focal_window@target. The water-calibrated gate
+    uses the peak time of the target sensor in the homogeneous-water sim as
+    the gate center for the corresponding skull sims' target sensor.
+  - OUTPUT_TAG env var to prefix output filenames (so batch reruns don't
+    clobber prior results).
+  - Runs SIM C (water) FIRST so its target-peak time is available for the
+    skull sim probes.
   - A final one-line machine-parseable summary:
       SUBJECT_SUMMARY subject=<ID> bone_pct=<X> skull_path_near=<Y>
       p_water=<Z> p_skull=<W> p_geom_skull=<V>
       gain_vs_mean_water=<G> gain_vs_mean_skull=<H> atten_db=<A>
-  - Per-subject output filenames so runs don't clobber each other
+      p_fw_geom_water=<> p_fw_geom_skull_corr=<> p_fw_geom_skull_geom=<>
+      p_fw_water_skull_corr=<> p_fw_water_skull_geom=<>
+      t_water_peak_us=<> tof_geom_us=<>
+      atten_db_fw_geom=<> atten_db_fw_water=<>
 
 This script is intentionally NOT committed; it's a local batch-driver tool.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import logging
 import os
+import pathlib
 import sys
 import time
 
@@ -39,6 +53,7 @@ logging.log = _patched_log
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import nibabel as nib
 import numpy as np
@@ -55,7 +70,13 @@ from openlifu.seg.material import MATERIALS, Material
 from openlifu.seg.seg_method import SegmentationMethod
 from openlifu.seg.seg_methods.nnunet_seg import LABEL_MAP_FULLHEAD
 from openlifu.seg.seg_methods.threshold_mri import CSF, GRAY_MATTER, WHITE_MATTER
-from openlifu.sim.kwave_if import run_simulation
+from openlifu.sim.kwave_if import (
+    get_kgrid,
+    get_medium,
+    get_point_source,
+    run_simulation,
+)
+from openlifu.util.units import getunitconversion
 from openlifu.xdc import Transducer
 from openlifu.xdc.element import Element
 
@@ -79,6 +100,8 @@ C0 = 1500.0
 T_END_SAFETY = 2.0
 GRID_MARGIN_MM = 10.0
 APERTURE_BAND_RADIUS_MM = 10.0
+
+ENABLE_TIMEGATED_PROBE = os.environ.get("OPENLIFU_DISABLE_TIMEGATED_PROBE", "") != "1"
 
 
 def _default_fullhead_materials() -> dict[str, Material]:
@@ -234,6 +257,315 @@ def compute_focal_gain(pmax, coord_arrays_xyz, target_mm, positions_world,
     }
 
 
+# ---------------------------------------------------------------------------
+# Time-gated probe (mirrored from run_gladys_nnunet.py, with the addition of
+# a water-calibrated gate center for the target sensor).
+# ---------------------------------------------------------------------------
+def _run_sparse_sensor_sim(
+    arr: Transducer,
+    params: xa.Dataset,
+    delays: np.ndarray,
+    apod: np.ndarray,
+    sensor_mask_params_order: np.ndarray,
+    freq: float,
+    cycles: int,
+    amplitude: float,
+    dt: float,
+    t_end: float,
+    cfl: float,
+    gpu: bool,
+    ref_values_only: bool,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    from kwave.ksensor import kSensor
+    from kwave.kspaceFirstOrder3D import kspaceFirstOrder3D
+    from kwave.options.simulation_execution_options import SimulationExecutionOptions
+    from kwave.options.simulation_options import SimulationOptions
+
+    kgrid = get_kgrid(params.coords, dt=dt, t_end=t_end, cfl=cfl)
+    if t_end == 0:
+        _coord_units = [params[dim].attrs["units"] for dim in params.dims]
+        _scl_to_m = getunitconversion(_coord_units[0], "m")
+        _c_ref = float(params["sound_speed"].attrs.get("ref_value", 1500.0))
+        _max_delay = float(np.max(np.abs(delays)))
+        _extents_sq = 0.0
+        for dim in params.dims:
+            cv = params.coords[dim].to_numpy()
+            _extents_sq += ((float(cv[-1]) - float(cv[0])) * _scl_to_m) ** 2
+        _grid_diagonal = float(np.sqrt(_extents_sq))
+        _signal_duration = cycles / freq
+        _t_end_needed = (_max_delay + _grid_diagonal / _c_ref + _signal_duration) * 1.1
+        _auto_t_end = float(kgrid.Nt * kgrid.dt)
+        if _auto_t_end < _t_end_needed:
+            kgrid = get_kgrid(params.coords, dt=float(kgrid.dt), t_end=_t_end_needed, cfl=cfl)
+
+    t = np.arange(
+        0,
+        np.min([cycles / freq, (kgrid.Nt - np.ceil(max(delays) / kgrid.dt)) * kgrid.dt]),
+        kgrid.dt,
+    )
+    input_signal = amplitude * np.sin(2 * np.pi * freq * t)
+
+    medium = get_medium(params, ref_values_only=ref_values_only)
+    source_mat = arr.calc_output(input_signal, kgrid.dt, delays, apod)
+    source = get_point_source(arr, params, source_mat)
+
+    dim_names = list(params.dims)
+    _dim_order = {"x": 0, "y": 1, "z": 2}
+    perm = [_dim_order[d] for d in dim_names]
+    inv_perm = [0, 0, 0]
+    for i, p in enumerate(perm):
+        inv_perm[p] = i
+    sensor_mask_xyz = np.transpose(sensor_mask_params_order, inv_perm)
+
+    nz = np.nonzero(sensor_mask_xyz)
+    lin = (
+        nz[0].astype(np.int64)
+        + nz[1].astype(np.int64) * sensor_mask_xyz.shape[0]
+        + nz[2].astype(np.int64) * sensor_mask_xyz.shape[0] * sensor_mask_xyz.shape[1]
+    )
+    order = np.argsort(lin)
+    xyz_sensor_indices = np.stack([nz[0][order], nz[1][order], nz[2][order]], axis=-1)
+
+    sensor = kSensor(sensor_mask_xyz, record=["p"])
+    simulation_options = SimulationOptions(
+        pml_auto=True, pml_inside=False, save_to_disk=True, data_cast="single",
+    )
+    execution_options = SimulationExecutionOptions(is_gpu_simulation=gpu)
+    inputs = {
+        "kgrid": kgrid, "source": source, "sensor": sensor, "medium": medium,
+        "simulation_options": simulation_options, "execution_options": execution_options,
+    }
+    logger.info(
+        "Running sparse-sensor probe (%d sensor voxels, ref_values_only=%s)...",
+        int(xyz_sensor_indices.shape[0]), ref_values_only,
+    )
+    try:
+        output = kspaceFirstOrder3D(**deepcopy(inputs))
+    finally:
+        for fpath in [simulation_options.input_filename, simulation_options.output_filename]:
+            with contextlib.suppress(OSError):
+                pathlib.Path(fpath).unlink(missing_ok=True)
+
+    p_sensor = np.asarray(output["p"])
+    if p_sensor.ndim == 1:
+        p_sensor = p_sensor.reshape(-1, 1)
+    return p_sensor, float(kgrid.dt), xyz_sensor_indices
+
+
+def _build_sensor_mask(
+    params: xa.Dataset,
+    target_mm: np.ndarray,
+    aperture_center_mm: np.ndarray,
+) -> tuple[np.ndarray, list[str], list[tuple[int, int, int]], list[np.ndarray]]:
+    axis_vec = aperture_center_mm - target_mm
+    axis_len = float(np.linalg.norm(axis_vec))
+    if axis_len < 1e-6:
+        raise ValueError("aperture center coincides with target; cannot build sensor mask")
+    axis_unit = axis_vec / axis_len
+
+    perp = None
+    for cand in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])):
+        cross = np.cross(axis_unit, cand)
+        if np.linalg.norm(cross) > 0.5:
+            p = cand - axis_unit * np.dot(cand, axis_unit)
+            p_norm = np.linalg.norm(p)
+            if p_norm > 1e-6:
+                perp = p / p_norm
+                break
+    if perp is None:
+        perp = np.array([1.0, 0.0, 0.0])
+
+    sensor_world_mm = [
+        ("target",        target_mm.copy()),
+        ("aperture_ctr",  aperture_center_mm.copy()),
+        ("midway",        target_mm + 0.5 * axis_vec),
+        ("quarterway",    target_mm + 0.75 * axis_vec),
+        ("off_axis_15mm", target_mm + 15.0 * perp),
+    ]
+
+    sim_dim_names = list(params.dims)
+    sim_coord_params = {d: params.coords[d].to_numpy() for d in sim_dim_names}
+    mask = np.zeros(tuple(len(sim_coord_params[d]) for d in sim_dim_names), dtype=np.int32)
+
+    names: list[str] = []
+    xyz_idx_list: list[tuple[int, int, int]] = []
+    actual_list: list[np.ndarray] = []
+    for name, pos_mm in sensor_world_mm:
+        idx_in_params: list[int] = []
+        idx_in_xyz = [0, 0, 0]
+        actual = np.zeros(3)
+        for _params_ax, dim in enumerate(sim_dim_names):
+            cv = sim_coord_params[dim]
+            xyz_ax = {"x": 0, "y": 1, "z": 2}[dim]
+            val = pos_mm[xyz_ax]
+            i = int(np.argmin(np.abs(cv - val)))
+            idx_in_params.append(i)
+            idx_in_xyz[xyz_ax] = i
+            actual[xyz_ax] = float(cv[i])
+        mask[tuple(idx_in_params)] = 1
+        names.append(name)
+        xyz_idx_list.append(tuple(idx_in_xyz))
+        actual_list.append(actual)
+    return mask, names, xyz_idx_list, actual_list
+
+
+def _run_timegated_probe(
+    *,
+    arr: Transducer,
+    params: xa.Dataset,
+    delays: np.ndarray,
+    apod: np.ndarray,
+    target_mm: np.ndarray,
+    aperture_center_mm: np.ndarray,
+    common_kwargs: dict,
+    ref_values_only: bool,
+    sim_label: str,
+    target_gate_center_s: float | None = None,
+) -> dict | None:
+    """Run the sparse-sensor probe and compute time-gated metrics.
+
+    Returns per-sensor metrics + summary. For the target sensor, always reports
+    `p_focal_window_Pa` (geometric-gate using tof @ C0=1500), and additionally
+    `p_focal_window_water_gate_Pa` when `target_gate_center_s` is supplied
+    (this is the peak time extracted from the water sim's target time series,
+    used as the gate center for skull sims). Other sensors always use their
+    geometric TOF as the gate center.
+    """
+    try:
+        mask, names, xyz_idx_list, actual_list = _build_sensor_mask(
+            params, target_mm, aperture_center_mm,
+        )
+        probe_kwargs = dict(common_kwargs)
+        probe_kwargs.pop("arr", None)
+        probe_kwargs.pop("apod", None)
+        probe_kwargs.pop("source_method", None)
+
+        t0 = time.time()
+        p_sensor, dt_probe, xyz_order = _run_sparse_sensor_sim(
+            arr=arr,
+            params=params,
+            delays=delays,
+            apod=apod,
+            sensor_mask_params_order=mask,
+            ref_values_only=ref_values_only,
+            **probe_kwargs,
+        )
+        probe_secs = time.time() - t0
+        logger.info(
+            "    [%s] probe done in %.1fs (p shape=%s, dt=%.2f ns)",
+            sim_label, probe_secs, p_sensor.shape, dt_probe * 1e9,
+        )
+
+        pulse_dur = CYCLES / FREQ_HZ  # seconds
+        Nt = p_sensor.shape[0]
+        t_axis = np.arange(Nt) * dt_probe
+
+        def _col_for(xyz_idx_tuple: tuple[int, int, int]) -> int | None:
+            matches = np.where(
+                (xyz_order[:, 0] == xyz_idx_tuple[0])
+                & (xyz_order[:, 1] == xyz_idx_tuple[1])
+                & (xyz_order[:, 2] == xyz_idx_tuple[2])
+            )[0]
+            return int(matches[0]) if len(matches) else None
+
+        per_sensor = {}
+        for name, xyz_idx, actual in zip(names, xyz_idx_list, actual_list):
+            col = _col_for(xyz_idx)
+            d_m = float(np.linalg.norm(actual - aperture_center_mm)) * 1e-3
+            tof_s = d_m / C0  # geometric TOF @ C0 (water speed)
+            rec: dict[str, Any] = {
+                "sensor_world_mm": actual.tolist(),
+                "xyz_idx": list(xyz_idx),
+                "tof_s": tof_s,
+                "tof_us": tof_s * 1e6,
+                "dist_from_target_mm": float(np.linalg.norm(actual - target_mm)),
+                "dist_from_aperture_ctr_mm": float(np.linalg.norm(actual - aperture_center_mm)),
+            }
+            if col is None:
+                rec.update({
+                    "column": None,
+                    "p_focal_window_Pa": float("nan"),
+                    "p_focal_window_water_gate_Pa": float("nan"),
+                    "p_allt_Pa": float("nan"),
+                    "ratio": float("nan"),
+                    "peak_time_s": float("nan"),
+                    "p_t": [],
+                    "note": "voxel collision; no dedicated column",
+                })
+            else:
+                p_t = p_sensor[:, col]
+                p_abs = np.abs(p_t)
+                p_allt = float(p_abs.max())
+                peak_time_s = float(t_axis[int(np.argmax(p_abs))]) if Nt > 0 else float("nan")
+
+                # Geometric gate (existing metric)
+                t_lo = tof_s - 2.0 * pulse_dur
+                t_hi = tof_s + 2.0 * pulse_dur
+                in_win = (t_axis >= t_lo) & (t_axis <= t_hi)
+                p_fw_geom = float(p_abs[in_win].max()) if in_win.any() else float("nan")
+
+                # Water-calibrated gate (only for target sensor, when provided)
+                p_fw_water = float("nan")
+                if name == "target" and target_gate_center_s is not None:
+                    t_lo_w = target_gate_center_s - 2.0 * pulse_dur
+                    t_hi_w = target_gate_center_s + 2.0 * pulse_dur
+                    in_win_w = (t_axis >= t_lo_w) & (t_axis <= t_hi_w)
+                    p_fw_water = float(p_abs[in_win_w].max()) if in_win_w.any() else float("nan")
+
+                ratio = (p_fw_geom / p_allt) if (p_allt > 0 and np.isfinite(p_fw_geom)) else float("nan")
+                rec.update({
+                    "column": col,
+                    "p_focal_window_Pa": p_fw_geom,
+                    "p_focal_window_water_gate_Pa": p_fw_water,
+                    "p_allt_Pa": p_allt,
+                    "ratio": ratio,
+                    "peak_time_s": peak_time_s,
+                    "p_t": p_t.astype(np.float32).tolist(),
+                    "note": "",
+                })
+            per_sensor[name] = rec
+
+        result = {
+            "sim_label": sim_label,
+            "ref_values_only": bool(ref_values_only),
+            "dt_s": dt_probe,
+            "n_timesteps": int(Nt),
+            "pulse_duration_s": pulse_dur,
+            "focal_window_halfwidth_s": 2.0 * pulse_dur,
+            "c0_m_s": C0,
+            "target_mm": target_mm.tolist(),
+            "aperture_center_mm": aperture_center_mm.tolist(),
+            "sensors": per_sensor,
+            "probe_runtime_s": probe_secs,
+            "target_gate_center_s": target_gate_center_s,
+        }
+        tgt = per_sensor.get("target", {})
+        result["p_focal_window_at_target_Pa"] = tgt.get("p_focal_window_Pa", float("nan"))
+        result["p_focal_window_water_gate_at_target_Pa"] = tgt.get("p_focal_window_water_gate_Pa", float("nan"))
+        result["p_allt_at_target_Pa"] = tgt.get("p_allt_Pa", float("nan"))
+        result["ratio_at_target"] = tgt.get("ratio", float("nan"))
+        result["target_peak_time_s"] = tgt.get("peak_time_s", float("nan"))
+        result["target_tof_s"] = tgt.get("tof_s", float("nan"))
+        return result
+    except Exception as exc:
+        logger.warning(
+            "Time-gated probe failed for %s (%s); continuing without it.",
+            sim_label, exc, exc_info=True,
+        )
+        return None
+
+
+def _save_timegated_json(result: dict | None, out_path: Path) -> None:
+    if result is None:
+        return
+    try:
+        with open(out_path, "w") as f:
+            json.dump(result, f)
+        logger.info("    Saved time-gated sidecar: %s", out_path)
+    except Exception as exc:
+        logger.warning("Failed to save time-gated sidecar %s: %s", out_path, exc)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--subject", required=True,
@@ -244,6 +576,8 @@ def main():
                     help="Override label path (default: ~/Data/openlifu-validation/results/<subject>_nnunet_labels.nii.gz)")
     ap.add_argument("--results-dir", default=None,
                     help="Results dir (default: ~/Data/openlifu-validation/results)")
+    ap.add_argument("--output-tag", default=None,
+                    help="Prefix tag for output filenames (overrides OUTPUT_TAG env var)")
     args = ap.parse_args()
 
     subj = args.subject
@@ -259,9 +593,11 @@ def main():
     )
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    output_tag = args.output_tag if args.output_tag is not None else os.environ.get("OUTPUT_TAG", "")
+
     t_total = time.time()
     print("=" * 72)
-    print(f"GLADYS nnU-Net sim | subject={subj}")
+    print(f"GLADYS nnU-Net sim | subject={subj} | output_tag='{output_tag}'")
     print(f"  MRI:    {mri_path}")
     print(f"  Labels: {label_path}")
     print("=" * 72)
@@ -455,23 +791,61 @@ def main():
         dt=dt, t_end=t_end, cfl=CFL, gpu=True, source_method="point_source",
     )
 
+    # -------------------------------------------------------------------
+    # Run SIM C (water) FIRST so we can extract the water-target peak time
+    # and use it as the gate center for SIM A and SIM B probes.
+    # -------------------------------------------------------------------
+    print("\n[SIM C] geometric + water  (run FIRST for gate calibration)")
+    t0 = time.time()
+    result_c = run_simulation(params=sim_params, delays=delays_geo,
+                              ref_values_only=True, **common_kwargs)
+    print(f"  done in {time.time()-t0:.1f}s")
+    probe_c = _run_timegated_probe(
+        arr=arr, params=sim_params, delays=delays_geo, apod=apod,
+        target_mm=target_mm, aperture_center_mm=aperture_center_mm,
+        common_kwargs=common_kwargs, ref_values_only=True,
+        sim_label="SIM C (geometric+water)",
+        target_gate_center_s=None,  # water itself: only geom gate
+    ) if ENABLE_TIMEGATED_PROBE else None
+
+    t_water_target_peak = None
+    if probe_c is not None:
+        t_water_target_peak = probe_c.get("target_peak_time_s", None)
+        if t_water_target_peak is None or not np.isfinite(t_water_target_peak):
+            t_water_target_peak = None
+        else:
+            tgt_geom_tof = probe_c.get("target_tof_s", float("nan"))
+            print(
+                f"  [water-gate] target peak time = {t_water_target_peak*1e6:.2f} us, "
+                f"geom tof = {tgt_geom_tof*1e6:.2f} us, "
+                f"delta = {(t_water_target_peak - tgt_geom_tof)*1e6:+.2f} us"
+            )
+
     print("\n[SIM A] corrected + skull (nnU-Net)")
     t0 = time.time()
     result_a = run_simulation(params=sim_params, delays=delays_corrected,
                               ref_values_only=False, **common_kwargs)
     print(f"  done in {time.time()-t0:.1f}s")
+    probe_a = _run_timegated_probe(
+        arr=arr, params=sim_params, delays=delays_corrected, apod=apod,
+        target_mm=target_mm, aperture_center_mm=aperture_center_mm,
+        common_kwargs=common_kwargs, ref_values_only=False,
+        sim_label="SIM A (corrected+skull)",
+        target_gate_center_s=t_water_target_peak,
+    ) if ENABLE_TIMEGATED_PROBE else None
 
     print("\n[SIM B] geometric + skull")
     t0 = time.time()
     result_b = run_simulation(params=sim_params, delays=delays_geo,
                               ref_values_only=False, **common_kwargs)
     print(f"  done in {time.time()-t0:.1f}s")
-
-    print("\n[SIM C] geometric + water")
-    t0 = time.time()
-    result_c = run_simulation(params=sim_params, delays=delays_geo,
-                              ref_values_only=True, **common_kwargs)
-    print(f"  done in {time.time()-t0:.1f}s")
+    probe_b = _run_timegated_probe(
+        arr=arr, params=sim_params, delays=delays_geo, apod=apod,
+        target_mm=target_mm, aperture_center_mm=aperture_center_mm,
+        common_kwargs=common_kwargs, ref_values_only=False,
+        sim_label="SIM B (geometric+skull)",
+        target_gate_center_s=t_water_target_peak,
+    ) if ENABLE_TIMEGATED_PROBE else None
 
     cx = sim_coord_arrays[0]
     cy = sim_coord_arrays[1]
@@ -492,9 +866,9 @@ def main():
         return fg, raw_max, err
 
     print("\n--- FOCAL STATS ---")
+    stats_c, _, _ = _stats(result_c, "C geometric+water ")
     stats_a, _, _ = _stats(result_a, "A corrected+skull")
     stats_b, _, _ = _stats(result_b, "B geometric+skull")
-    stats_c, _, _ = _stats(result_c, "C geometric+water ")
 
     p_water = stats_c["p_at_target"]
     p_skull = stats_a["p_at_target"]
@@ -504,8 +878,39 @@ def main():
     else:
         atten_db = float("nan")
 
-    # Save pmax NIfTIs with subject prefix
-    for sim_label, result in [("corrected", result_a), ("geometric", result_b), ("water", result_c)]:
+    # Probe-derived attenuation
+    def _db(num, den):
+        if np.isfinite(num) and np.isfinite(den) and num > 0 and den > 0:
+            return 20.0 * np.log10(den / num)
+        return float("nan")
+
+    p_fw_geom_water = probe_c.get("p_focal_window_at_target_Pa", float("nan")) if probe_c else float("nan")
+    p_fw_geom_skull_corr = probe_a.get("p_focal_window_at_target_Pa", float("nan")) if probe_a else float("nan")
+    p_fw_geom_skull_geom = probe_b.get("p_focal_window_at_target_Pa", float("nan")) if probe_b else float("nan")
+    p_fw_water_skull_corr = probe_a.get("p_focal_window_water_gate_at_target_Pa", float("nan")) if probe_a else float("nan")
+    p_fw_water_skull_geom = probe_b.get("p_focal_window_water_gate_at_target_Pa", float("nan")) if probe_b else float("nan")
+
+    atten_db_fw_geom = _db(p_fw_geom_skull_corr, p_fw_geom_water)
+    atten_db_fw_water = _db(p_fw_water_skull_corr, p_fw_geom_water)
+
+    tof_geom_s = probe_c.get("target_tof_s", float("nan")) if probe_c else float("nan")
+    t_water_peak_s = t_water_target_peak if t_water_target_peak is not None else float("nan")
+
+    print("\n--- PROBE METRICS ---")
+    print(f"  p_fw_geom  water:       {p_fw_geom_water:.4g} Pa")
+    print(f"  p_fw_geom  skull_corr:  {p_fw_geom_skull_corr:.4g} Pa  (atten {atten_db_fw_geom:.2f} dB)")
+    print(f"  p_fw_geom  skull_geom:  {p_fw_geom_skull_geom:.4g} Pa")
+    print(f"  p_fw_water skull_corr:  {p_fw_water_skull_corr:.4g} Pa  (atten {atten_db_fw_water:.2f} dB)")
+    print(f"  p_fw_water skull_geom:  {p_fw_water_skull_geom:.4g} Pa")
+    print(f"  t_water_peak={t_water_peak_s*1e6 if np.isfinite(t_water_peak_s) else float('nan'):.2f} us, "
+          f"tof_geom={tof_geom_s*1e6 if np.isfinite(tof_geom_s) else float('nan'):.2f} us")
+
+    # Save pmax NIfTIs with subject prefix + optional tag
+    for sim_label, result, probe in [
+        ("corrected", result_a, probe_a),
+        ("geometric", result_b, probe_b),
+        ("water", result_c, probe_c),
+    ]:
         p_max_data = result["p_max"].to_numpy()
         out_affine = np.diag([
             float(cx[1] - cx[0]) if len(cx) > 1 else 1.0,
@@ -516,22 +921,42 @@ def main():
         out_affine[0, 3] = float(cx[0])
         out_affine[1, 3] = float(cy[0])
         out_affine[2, 3] = float(cz[0])
-        out_path = results_dir / f"{subj}_gladys_nnunet_{sim_label}_pmax.nii.gz"
+        out_path = results_dir / f"{subj}_{output_tag}gladys_nnunet_{sim_label}_pmax.nii.gz"
         nib.save(nib.Nifti1Image(p_max_data.astype(np.float32), out_affine), str(out_path))
+        print(f"    Saved: {out_path}")
+        sidecar_path = results_dir / f"{subj}_{output_tag}gladys_nnunet_{sim_label}_timegated.json"
+        _save_timegated_json(probe, sidecar_path)
 
     t_elapsed = time.time() - t_total
     print(f"\n[{subj}] Total: {t_elapsed:.0f}s ({t_elapsed/60:.1f} min)")
+
+    def _fmt(v):
+        try:
+            if not np.isfinite(v):
+                return "nan"
+            return f"{v:.6g}"
+        except Exception:
+            return "nan"
+
     print(
         f"SUBJECT_SUMMARY subject={subj} "
         f"bone_pct={pct_skull:.3f} "
         f"skull_path_near={skull_path_near_mm:.2f} "
-        f"skull_path_far={skull_path_far_mm:.2f} "
-        f"p_water={p_water:.6g} "
-        f"p_skull={p_skull:.6g} "
-        f"p_geom_skull={p_geom_skull:.6g} "
+        f"p_water={_fmt(p_water)} "
+        f"p_skull={_fmt(p_skull)} "
+        f"p_geom_skull={_fmt(p_geom_skull)} "
         f"gain_vs_mean_water={stats_c['gain_vs_mean']:.4f} "
         f"gain_vs_mean_skull={stats_a['gain_vs_mean']:.4f} "
-        f"atten_db={atten_db:.2f}"
+        f"atten_db={_fmt(atten_db)} "
+        f"p_fw_geom_water={_fmt(p_fw_geom_water)} "
+        f"p_fw_geom_skull_corr={_fmt(p_fw_geom_skull_corr)} "
+        f"p_fw_geom_skull_geom={_fmt(p_fw_geom_skull_geom)} "
+        f"p_fw_water_skull_corr={_fmt(p_fw_water_skull_corr)} "
+        f"p_fw_water_skull_geom={_fmt(p_fw_water_skull_geom)} "
+        f"t_water_peak_us={_fmt(t_water_peak_s*1e6) if np.isfinite(t_water_peak_s) else 'nan'} "
+        f"tof_geom_us={_fmt(tof_geom_s*1e6) if np.isfinite(tof_geom_s) else 'nan'} "
+        f"atten_db_fw_geom={_fmt(atten_db_fw_geom)} "
+        f"atten_db_fw_water={_fmt(atten_db_fw_water)}"
     )
 
 
