@@ -45,7 +45,7 @@ import nibabel as nib
 import numpy as np
 import xarray as xa
 from scipy.interpolate import RegularGridInterpolator
-from scipy.signal import hilbert
+from scipy.signal import butter, hilbert, sosfiltfilt
 
 # -------------------------------------------------------------------
 # Patch kwave's mis-formatted logging.log() calls (same patch that
@@ -356,156 +356,300 @@ def main() -> int:
     voxel_to_col = {idx: col for col, idx in enumerate(sorted_nonzero)}
 
     # -------------------------------------------------------------------
-    # Per-element narrowband amplitude & phase at 500 kHz at envelope peak.
+    # Pull per-element columns out of sensor_data (xyz Fortran order).
     # -------------------------------------------------------------------
-    print(f"\n[7] Extracting per-element amplitudes and narrowband phases ...")
-    t_axis = np.arange(Nt) * dt
-    # Narrowband demodulator: carrier at FREQ_HZ. phase_i at peak = angle of
-    # analytic_signal(t_peak) * exp(-j * 2*pi*FREQ*t_peak).
-    carrier = np.exp(-1j * 2 * np.pi * FREQ_HZ * t_axis)
-
-    amplitudes = np.zeros(N_ELEMENTS)
-    phases_raw = np.zeros(N_ELEMENTS)
-    peak_samples = np.zeros(N_ELEMENTS, dtype=int)
-    tof_samples = np.zeros(N_ELEMENTS, dtype=int)
-
-    # Gate bound uses max sound speed in grid (bone ~3000 m/s) for earliest
-    # plausible arrival, same as SimulationCorrected.
-    c_max = float(np.max(sim_params["sound_speed"].to_numpy()))
-    c_max = max(c_max, C0)
-
+    per_element_signals = np.zeros((N_ELEMENTS, Nt), dtype=sensor_data.dtype)
     for el_i, sensor_idx in enumerate(sensor_indices):
         sensor_idx_xyz = tuple(sensor_idx[i] for i in perm_to_xyz)
         col = voxel_to_col[sensor_idx_xyz]
-        p_t = sensor_data[:, col]
-        analytic = hilbert(p_t)
-        envelope = np.abs(analytic)
+        per_element_signals[el_i] = sensor_data[:, col]
 
-        earliest_arrival_s = (
-            np.linalg.norm(element_positions_raw[el_i] - target_pos_raw)
-            * scl_to_m
-            / c_max
-        )
-        gate_start = max(0, int((earliest_arrival_s - 2 * dt) / dt))
-        if gate_start >= len(envelope):
-            gate_start = 0
-        peak_sample = gate_start + int(np.argmax(envelope[gate_start:]))
-        peak_samples[el_i] = peak_sample
+    c_max = float(np.max(sim_params["sound_speed"].to_numpy()))
+    c_max = max(c_max, C0)
 
-        # Amplitude = envelope peak
-        amplitudes[el_i] = float(envelope[peak_sample])
-
-        # Narrowband phase at the envelope peak sample, relative to the
-        # 500 kHz carrier (so the unwrapped phase is ~constant if the signal
-        # is a clean tone burst).
-        demod = analytic[peak_sample] * carrier[peak_sample]
-        phases_raw[el_i] = float(np.angle(demod))
-
-        # Geometric TOF (for diagnostics only).
-        tof_samples[el_i] = int(round(
-            (np.linalg.norm(element_positions_raw[el_i] - target_pos_raw) * scl_to_m / C0)
-            / dt
-        ))
+    dists_raw = np.linalg.norm(element_positions_raw - target_pos_raw, axis=1)
 
     # -------------------------------------------------------------------
-    # Normalize phases: subtract the circular median so median(phi_i) == 0.
-    # The bulk arrival-time offset that the delay correction would cancel
-    # is a constant phase across elements, so factoring out the median
-    # (robust to a few outliers) leaves only the RESIDUAL per-element
-    # incoherence.
+    # (A) Legacy CF: per-element envelope-peak amplitude + analytic-signal
+    #     phase at that same sample, median-centered. Kept for reference.
     # -------------------------------------------------------------------
-    # "Circular median" via the phase of the median of (cos, sin).
-    cos_med = float(np.median(np.cos(phases_raw)))
-    sin_med = float(np.median(np.sin(phases_raw)))
-    median_phase = float(np.arctan2(sin_med, cos_med))
-    phases = np.angle(np.exp(1j * (phases_raw - median_phase)))  # wrap to (-pi, pi]
-
-    # -------------------------------------------------------------------
-    # Complex coherence factor.
-    # -------------------------------------------------------------------
-    a_sum = float(np.sum(amplitudes))
-    vec_sum = np.sum(amplitudes * np.exp(1j * phases))
-    CF = float(np.abs(vec_sum) / a_sum) if a_sum > 0 else float("nan")
-    CF_db = 20.0 * np.log10(CF) if CF > 0 else float("-inf")
-
-    # Amplitude-weighted phase statistics (circular).
-    w = amplitudes / a_sum if a_sum > 0 else np.ones_like(amplitudes) / len(amplitudes)
-    mean_cos = float(np.sum(w * np.cos(phases)))
-    mean_sin = float(np.sum(w * np.sin(phases)))
-    R = float(np.sqrt(mean_cos ** 2 + mean_sin ** 2))  # circular mean resultant
-    circ_std_weighted = float(np.sqrt(-2.0 * np.log(max(R, 1e-12))))
-
-    # Unweighted stats (for direct intuition).
-    cos_mean = float(np.mean(np.cos(phases)))
-    sin_mean = float(np.mean(np.sin(phases)))
-    R_unw = float(np.sqrt(cos_mean ** 2 + sin_mean ** 2))
-    circ_std_unweighted = float(np.sqrt(-2.0 * np.log(max(R_unw, 1e-12))))
-
-    # Per-element wrapped-phase std (linear stat - coarse; for intuition only).
-    phase_std_rad = float(np.std(phases))
-    phase_std_cycles = phase_std_rad / (2 * np.pi)
-    amp_mean = float(np.mean(amplitudes))
-    amp_std = float(np.std(amplitudes))
-    amp_min = float(np.min(amplitudes))
-    amp_max = float(np.max(amplitudes))
+    print(f"\n[7a] Legacy CF (envelope-peak-per-element, median-centered) ...")
+    legacy = _legacy_coherence_factor(
+        per_element_signals=per_element_signals,
+        dt=dt,
+        element_positions_raw=element_positions_raw,
+        target_pos_raw=target_pos_raw,
+        freq_hz=FREQ_HZ,
+        scl_to_m=scl_to_m,
+        c_max=c_max,
+    )
 
     # -------------------------------------------------------------------
-    # Report.
+    # (B) Corrected CF: bandpass + narrowband projection onto a carrier
+    #     referenced to each element's own arrival time. After the
+    #     reciprocal-sim delay correction, all arrival times map to the
+    #     same common focal time, so the resulting complex coefficients
+    #     sum coherently at that one sample. CF = |sum c_i|/sum |c_i|.
+    # -------------------------------------------------------------------
+    print(f"\n[7b] Corrected CF (common-focal-time, bandpass + narrowband projection) ...")
+    corrected = _common_focal_time_coherence_factor(
+        per_element_signals=per_element_signals,
+        dt=dt,
+        element_positions_raw=element_positions_raw,
+        target_pos_raw=target_pos_raw,
+        freq_hz=FREQ_HZ,
+        n_cycles=RECIPROCAL_N_CYCLES,
+        scl_to_m=scl_to_m,
+        c_max=c_max,
+    )
+
+    # -------------------------------------------------------------------
+    # Report both.
     # -------------------------------------------------------------------
     print("\n" + "=" * 78)
-    print(" COHERENCE FACTOR RESULT")
+    print(" COHERENCE FACTOR RESULTS")
     print("=" * 78)
-    print(f"  CF                 = {CF:.4f}")
-    print(f"  20*log10(CF)       = {CF_db:.2f} dB  (negative = pressure-amplitude loss)")
-    print(f"  -> unexplained gap = 20 dB;   predicted from CF = {-CF_db:.2f} dB")
-    if np.isfinite(CF_db):
-        residual = 20.0 - (-CF_db)
-        verdict = "CONFIRMED" if abs(residual) <= 3.0 else (
-            "PARTIAL" if -CF_db > 10.0 else "NOT SUPPORTED"
-        )
-        print(f"  residual after CF  = {residual:+.2f} dB   verdict: {verdict}")
+    print(f"  Legacy CF    (envelope-peak-per-element, median-centered):")
+    print(f"    CF           = {legacy['CF']:.4f}")
+    print(f"    20*log10(CF) = {legacy['CF_db']:+.2f} dB")
+    print(f"  Corrected CF (common focal time, narrowband projection, 10% bandpass):")
+    print(f"    CF           = {corrected['CF']:.4f}")
+    print(f"    20*log10(CF) = {corrected['CF_db']:+.2f} dB")
+    delta = corrected['CF'] - legacy['CF']
+    delta_db = corrected['CF_db'] - legacy['CF_db']
+    print(f"  Delta (corrected - legacy): {delta:+.4f}  ({delta_db:+.2f} dB)")
+    if abs(delta) <= 0.05:
+        print(f"  -> Within 0.05 -> legacy approach was fine as a proxy.")
+    else:
+        print(f"  -> Diverge beyond 0.05 -> legacy approach was NOT interchangeable.")
 
-    print("\n  Amplitude distribution across 64 elements:")
-    print(f"    mean={amp_mean:.3g}  std={amp_std:.3g}  min={amp_min:.3g}  max={amp_max:.3g}")
-    print(f"    dynamic range (max/min) = {amp_max / max(amp_min, 1e-30):.2f}x")
-    # 10-bin amplitude histogram
-    amp_bins = np.linspace(amp_min, amp_max, 11) if amp_max > amp_min else np.linspace(0, 1, 11)
-    amp_hist, _ = np.histogram(amplitudes, bins=amp_bins)
-    print("    hist (edges -> count):")
-    for lo, hi, c in zip(amp_bins[:-1], amp_bins[1:], amp_hist):
-        bar = "#" * int(c)
-        print(f"      [{lo:>10.3g} .. {hi:<10.3g}] {c:>3d} {bar}")
+    # ---- Amplitude histograms for both, ten bins each.
+    for tag, res in (("LEGACY", legacy), ("CORRECTED", corrected)):
+        amps = res["amplitudes"]
+        amp_mean = float(np.mean(amps))
+        amp_std = float(np.std(amps))
+        amp_min = float(np.min(amps))
+        amp_max = float(np.max(amps))
+        print(f"\n  {tag}: amplitude distribution across 64 elements:")
+        print(f"    mean={amp_mean:.3g}  std={amp_std:.3g}  min={amp_min:.3g}  max={amp_max:.3g}")
+        print(f"    dynamic range (max/min) = {amp_max / max(amp_min, 1e-30):.2f}x")
+        amp_bins = np.linspace(amp_min, amp_max, 11) if amp_max > amp_min else np.linspace(0, 1, 11)
+        amp_hist, _ = np.histogram(amps, bins=amp_bins)
+        print("    hist (edges -> count):")
+        for lo, hi, c in zip(amp_bins[:-1], amp_bins[1:], amp_hist):
+            bar = "#" * int(c)
+            print(f"      [{lo:>10.3g} .. {hi:<10.3g}] {c:>3d} {bar}")
 
-    print("\n  Phase (median-centered) distribution in radians:")
-    print(f"    std (linear, rad)             = {phase_std_rad:.4f}  ({phase_std_cycles:.4f} cycles)")
-    print(f"    circular std, unweighted      = {circ_std_unweighted:.4f} rad")
-    print(f"    circular std, amplitude-weight = {circ_std_weighted:.4f} rad   "
-          f"({circ_std_weighted / (2 * np.pi):.4f} cycles)")
-    print(f"    circular mean resultant R      = {R:.4f}  (amplitude-weighted)")
-    # 12-bin phase histogram over (-pi, pi]
+    # ---- Phase histogram (CORRECTED). Phases relative to common focal time.
+    phases_c = corrected["phases"]
+    amps_c = corrected["amplitudes"]
+    a_sum_c = float(np.sum(amps_c))
+    w_c = amps_c / a_sum_c if a_sum_c > 0 else np.ones_like(amps_c) / len(amps_c)
+    mean_cos_c = float(np.sum(w_c * np.cos(phases_c)))
+    mean_sin_c = float(np.sum(w_c * np.sin(phases_c)))
+    R_c = float(np.sqrt(mean_cos_c ** 2 + mean_sin_c ** 2))
+    circ_std_w_c = float(np.sqrt(-2.0 * np.log(max(R_c, 1e-12))))
+
+    print("\n  CORRECTED: phase distribution (referenced to common focal time) [rad]:")
+    print(f"    circular std, amplitude-weighted = {circ_std_w_c:.4f} rad "
+          f"({circ_std_w_c / (2 * np.pi):.4f} cycles)")
+    print(f"    circular mean resultant R         = {R_c:.4f}  (= corrected CF)")
     ph_bins = np.linspace(-np.pi, np.pi, 13)
-    ph_hist, _ = np.histogram(phases, bins=ph_bins)
+    ph_hist, _ = np.histogram(phases_c, bins=ph_bins)
     print("    hist (rad edges -> count):")
     for lo, hi, c in zip(ph_bins[:-1], ph_bins[1:], ph_hist):
         bar = "#" * int(c)
         print(f"      [{lo:>+5.2f} .. {hi:<+5.2f}] {c:>3d} {bar}")
 
-    # Per-element table
-    print("\n  Per-element details (el, dist_mm, a_i, phi_rad, phi_cycles):")
+    # ---- Per-element table (CORRECTED).
+    print("\n  Per-element details (CORRECTED; el, dist_mm, a_i, phi_rad, phi_cycles):")
     for el_i in range(N_ELEMENTS):
-        d_mm = float(np.linalg.norm(element_positions_raw[el_i] - target_pos_raw))
-        print(f"    el={el_i:02d}  d={d_mm:6.2f}mm  a={amplitudes[el_i]:.3g}  "
-              f"phi={phases[el_i]:+.3f}rad  ({phases[el_i] / (2 * np.pi):+.3f} cyc)")
+        d_mm = float(dists_raw[el_i])
+        print(f"    el={el_i:02d}  d={d_mm:6.2f}mm  a={amps_c[el_i]:.3g}  "
+              f"phi={phases_c[el_i]:+.3f}rad  ({phases_c[el_i] / (2 * np.pi):+.3f} cyc)")
+
+    # -------------------------------------------------------------------
+    # Physical-interpretation block. The corrected CF is the one that
+    # actually represents coherent summation at the common focal time.
+    # -------------------------------------------------------------------
+    CF_primary = corrected["CF"]
+    CF_primary_db = corrected["CF_db"]
+    print("\n" + "=" * 78)
+    print(" PHYSICAL INTERPRETATION")
+    print("=" * 78)
+    print(f"  Primary CF (physical)    = {CF_primary:.4f}  (common-focal-time, narrowband projection)")
+    print(f"  20*log10(CF_corrected)   = {CF_primary_db:+.2f} dB  "
+          f"(pressure-amplitude loss from spatial decoherence at focus)")
+    print(f"  Legacy CF (reference)    = {legacy['CF']:.4f}  ({legacy['CF_db']:+.2f} dB)")
+    if np.isfinite(CF_primary_db):
+        residual = 20.0 - (-CF_primary_db)
+        verdict = "CONFIRMED" if abs(residual) <= 3.0 else (
+            "PARTIAL" if -CF_primary_db > 10.0 else "NOT SUPPORTED"
+        )
+        print(f"  Target unexplained gap   = 20 dB")
+        print(f"  CF-attributed loss       = {-CF_primary_db:.2f} dB")
+        print(f"  residual after CF        = {residual:+.2f} dB   verdict: {verdict}")
 
     # Summary line for grep-friendliness.
     print("\n" + "=" * 78)
-    print(f" SUMMARY  CF={CF:.4f}  20log10(CF)={CF_db:+.2f}dB  "
-          f"phase_std_weighted={circ_std_weighted:.3f}rad  "
-          f"amp_dyn={amp_max / max(amp_min, 1e-30):.1f}x")
+    print(f" SUMMARY  CF_corrected={corrected['CF']:.4f} "
+          f"20log10(CF_corrected)={corrected['CF_db']:+.2f}dB  "
+          f"CF_legacy={legacy['CF']:.4f} "
+          f"20log10(CF_legacy)={legacy['CF_db']:+.2f}dB  "
+          f"PHYSICAL=CORRECTED")
     print("=" * 78)
 
     print(f"\nTotal elapsed: {time.time() - t_total:.1f}s")
     return 0
+
+
+def _legacy_coherence_factor(
+    *,
+    per_element_signals: np.ndarray,
+    dt: float,
+    element_positions_raw: np.ndarray,
+    target_pos_raw: np.ndarray,
+    freq_hz: float,
+    scl_to_m: float,
+    c_max: float,
+) -> dict:
+    """Legacy coherence factor (per-element envelope peak, analytic-signal phase
+    at that sample, median-centered across elements). Kept for reference."""
+    n_el, Nt = per_element_signals.shape
+    t_axis = np.arange(Nt) * dt
+    carrier = np.exp(-1j * 2 * np.pi * freq_hz * t_axis)
+
+    amplitudes = np.zeros(n_el)
+    phases_raw = np.zeros(n_el)
+
+    for el_i in range(n_el):
+        p_t = per_element_signals[el_i]
+        analytic = hilbert(p_t)
+        envelope = np.abs(analytic)
+
+        earliest_arrival_s = (
+            float(np.linalg.norm(element_positions_raw[el_i] - target_pos_raw))
+            * scl_to_m / c_max
+        )
+        gate_start = max(0, int((earliest_arrival_s - 2 * dt) / dt))
+        if gate_start >= len(envelope):
+            gate_start = 0
+        peak_sample = gate_start + int(np.argmax(envelope[gate_start:]))
+
+        amplitudes[el_i] = float(envelope[peak_sample])
+        demod = analytic[peak_sample] * carrier[peak_sample]
+        phases_raw[el_i] = float(np.angle(demod))
+
+    # Circular median of raw phases -> subtract -> wrap to (-pi, pi].
+    cos_med = float(np.median(np.cos(phases_raw)))
+    sin_med = float(np.median(np.sin(phases_raw)))
+    median_phase = float(np.arctan2(sin_med, cos_med))
+    phases = np.angle(np.exp(1j * (phases_raw - median_phase)))
+
+    a_sum = float(np.sum(amplitudes))
+    vec_sum = np.sum(amplitudes * np.exp(1j * phases))
+    CF = float(np.abs(vec_sum) / a_sum) if a_sum > 0 else float("nan")
+    CF_db = 20.0 * np.log10(CF) if CF > 0 else float("-inf")
+
+    return dict(CF=CF, CF_db=CF_db, amplitudes=amplitudes, phases=phases)
+
+
+def _common_focal_time_coherence_factor(
+    *,
+    per_element_signals: np.ndarray,
+    dt: float,
+    element_positions_raw: np.ndarray,
+    target_pos_raw: np.ndarray,
+    freq_hz: float,
+    n_cycles: int,
+    scl_to_m: float,
+    c_max: float,
+) -> dict:
+    """Corrected CF: each element's bandpassed signal is projected onto a
+    narrowband carrier referenced to the element's own envelope-peak arrival
+    time, over a short window of +/- pulse_duration. After the reciprocal-sim
+    delay correction (delays = max(arrival_times) - arrival_times), every
+    element's arrival maps to the SAME common focal time, so summing those
+    complex coefficients is equivalent to evaluating all elements at one
+    common focal time. CF = |sum c_i| / sum |c_i|.
+    """
+    n_el, Nt = per_element_signals.shape
+    fs = 1.0 / dt
+
+    # 10 percent bandpass around freq_hz.
+    low = 0.9 * freq_hz
+    high = 1.1 * freq_hz
+    nyq = 0.5 * fs
+    if high >= nyq:
+        # Rare; fall back to slightly tighter band.
+        high = 0.95 * nyq
+        low = max(low, 0.5 * freq_hz)
+    sos = butter(4, [low, high], btype="band", fs=fs, output="sos")
+
+    # Pulse duration: window +/- n_cycles/freq_hz around arrival.
+    pulse_dur = n_cycles / freq_hz
+
+    t_axis = np.arange(Nt) * dt
+
+    # First pass: find each element's arrival time from the bandpassed envelope.
+    arrival_samples = np.zeros(n_el, dtype=int)
+    filtered = np.zeros_like(per_element_signals, dtype=np.float64)
+    for el_i in range(n_el):
+        filt = sosfiltfilt(sos, per_element_signals[el_i].astype(np.float64))
+        filtered[el_i] = filt
+        env = np.abs(hilbert(filt))
+        earliest_arrival_s = (
+            float(np.linalg.norm(element_positions_raw[el_i] - target_pos_raw))
+            * scl_to_m / c_max
+        )
+        gate_start = max(0, int((earliest_arrival_s - 2 * dt) / dt))
+        if gate_start >= len(env):
+            gate_start = 0
+        arrival_samples[el_i] = gate_start + int(np.argmax(env[gate_start:]))
+
+    arrival_times = arrival_samples * dt
+
+    # Narrowband projection for each element over [t_arrival - pulse_dur, t_arrival + pulse_dur].
+    # c_i = integral_{t in window} filt(t) * exp(-j 2 pi f (t - t_arrival_i)) dt
+    # After delays = max(arrival_times) - arrival_times, the carrier phase is
+    # referenced to element-local arrival, so summing c_i over elements is
+    # equivalent to evaluating all elements at the common focal time.
+    complex_coeffs = np.zeros(n_el, dtype=np.complex128)
+    for el_i in range(n_el):
+        t_arr = arrival_times[el_i]
+        t_lo = t_arr - pulse_dur
+        t_hi = t_arr + pulse_dur
+        i_lo = max(0, int(np.floor(t_lo / dt)))
+        i_hi = min(Nt, int(np.ceil(t_hi / dt)) + 1)
+        if i_hi <= i_lo:
+            complex_coeffs[el_i] = 0.0
+            continue
+        seg = filtered[el_i, i_lo:i_hi]
+        tt = t_axis[i_lo:i_hi]
+        ref = np.exp(-1j * 2 * np.pi * freq_hz * (tt - t_arr))
+        # Trapezoidal integral, normalized by window duration so units are
+        # comparable across elements regardless of window clipping at signal
+        # boundaries.
+        integrand = seg * ref
+        coeff = np.trapezoid(integrand, tt) / (tt[-1] - tt[0] if len(tt) > 1 else dt)
+        complex_coeffs[el_i] = coeff
+
+    amplitudes = np.abs(complex_coeffs)
+    phases = np.angle(complex_coeffs)
+
+    a_sum = float(np.sum(amplitudes))
+    vec_sum = complex_coeffs.sum()
+    CF = float(np.abs(vec_sum) / a_sum) if a_sum > 0 else float("nan")
+    CF_db = 20.0 * np.log10(CF) if CF > 0 else float("-inf")
+
+    return dict(
+        CF=CF,
+        CF_db=CF_db,
+        amplitudes=amplitudes,
+        phases=phases,
+        complex_coeffs=complex_coeffs,
+        arrival_times=arrival_times,
+    )
 
 
 if __name__ == "__main__":
