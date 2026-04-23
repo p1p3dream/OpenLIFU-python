@@ -875,7 +875,18 @@ def main():
                     help="Results dir (default: ~/Data/openlifu-validation/results)")
     ap.add_argument("--output-tag", default=None,
                     help="Prefix tag for output filenames (overrides OUTPUT_TAG env var)")
+    ap.add_argument("--orient-theta", type=float, default=None,
+                    help="Polar angle (degrees) of array approach direction. "
+                         "theta=0 is +z (superior), theta=90 is in the xy-plane. "
+                         "Must be used together with --orient-phi.")
+    ap.add_argument("--orient-phi", type=float, default=None,
+                    help="Azimuthal angle (degrees) of array approach direction. "
+                         "phi=0 is +x, phi=90 is +y. Direction is from brain center "
+                         "to array aperture center. Must be used together with --orient-theta.")
     args = ap.parse_args()
+
+    if (args.orient_theta is None) != (args.orient_phi is None):
+        ap.error("--orient-theta and --orient-phi must be provided together.")
 
     subj = args.subject
     mri_path = Path(args.mri_path) if args.mri_path else (
@@ -949,30 +960,52 @@ def main():
     max_skull_per_axis = np.array([
         float(skull_mm[ax].max() - target_mm[ax]) for ax in range(3)
     ])
-    approach_axis = int(np.argmax(max_skull_per_axis))
-    print(f"Approach axis: {dim_names[approach_axis]} (axis {approach_axis})")
+
+    if args.orient_theta is not None and args.orient_phi is not None:
+        # Manual override: build approach direction from spherical angles
+        theta_rad = np.radians(args.orient_theta)
+        phi_rad = np.radians(args.orient_phi)
+        approach_dir = np.array([
+            np.sin(theta_rad) * np.cos(phi_rad),
+            np.sin(theta_rad) * np.sin(phi_rad),
+            np.cos(theta_rad),
+        ])
+        orient_label = (
+            f"theta={args.orient_theta:.1f} deg, phi={args.orient_phi:.1f} deg "
+            f"(manual override)"
+        )
+    else:
+        # Auto-detect: axis with maximum skull extent
+        approach_axis = int(np.argmax(max_skull_per_axis))
+        approach_dir = np.zeros(3)
+        approach_dir[approach_axis] = 1.0
+        # Compute equivalent spherical angles for logging
+        auto_theta = np.degrees(np.arccos(np.clip(approach_dir[2], -1, 1)))
+        auto_phi = np.degrees(np.arctan2(approach_dir[1], approach_dir[0]))
+        orient_label = (
+            f"theta={auto_theta:.1f} deg, phi={auto_phi:.1f} deg "
+            f"(auto-detected axis {dim_names[approach_axis]})"
+        )
+
+    print(f"Array orientation: {orient_label}")
 
     # Array
     arr_local = create_hemispherical_array(
         n_elements=N_ELEMENTS, radius_mm=RADIUS_MM, aperture_mm=APERTURE_MM,
         freq_hz=FREQ_HZ, element_size_mm=ELEMENT_SIZE_MM,
     )
+
+    # Build rotation from local z-axis to approach_dir
+    z_axis = np.array([0.0, 0.0, 1.0])
+    v = np.cross(z_axis, approach_dir)
+    c = np.dot(z_axis, approach_dir)
+    if np.linalg.norm(v) < 1e-10:
+        R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    else:
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx / (1 + c)
     transform = np.eye(4)
-    transform[:3, 3] = target_mm
-    if approach_axis == 0:
-        angle = np.pi / 2
-        transform[:3, :3] = np.array([
-            [np.cos(angle), 0, np.sin(angle)],
-            [0, 1, 0],
-            [-np.sin(angle), 0, np.cos(angle)],
-        ])
-    elif approach_axis == 1:
-        angle = -np.pi / 2
-        transform[:3, :3] = np.array([
-            [1, 0, 0],
-            [0, np.cos(angle), -np.sin(angle)],
-            [0, np.sin(angle), np.cos(angle)],
-        ])
+    transform[:3, :3] = R
     transform[:3, 3] = target_mm
     arr = deepcopy(arr_local)
     for el in arr.elements:

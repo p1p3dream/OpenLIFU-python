@@ -112,7 +112,57 @@ def _parse_args() -> argparse.Namespace:
                    help="Absolute path to the T1 MRI NIfTI file")
     p.add_argument("--label-path", required=True, type=Path,
                    help="Absolute path to the nnU-Net label NIfTI file")
+    p.add_argument("--probe-at-peak", action="store_true",
+                   help="After CF at nominal target, read the spatial-search peak "
+                        "location from a *_timegated.json sidecar and run a second "
+                        "reciprocal sim with the virtual point source at the peak, "
+                        "then compute CF at that peak location too.")
+    p.add_argument("--peak-sidecar", type=Path, default=None,
+                   help="Override: absolute path to the *_corrected_timegated.json "
+                        "sidecar from which to read spatial_max_world_mm. If omitted, "
+                        "defaults are tried under "
+                        "~/Data/openlifu-validation/results/ : "
+                        "{subject}_spatial10mm_gladys_nnunet_corrected_timegated.json "
+                        "then {subject}_spatial_gladys_nnunet_corrected_timegated.json.")
     return p.parse_args()
+
+
+def _resolve_peak_sidecar(subject: str, override: Path | None) -> Path:
+    if override is not None:
+        if not override.exists():
+            raise FileNotFoundError(
+                f"--peak-sidecar does not exist: {override}"
+            )
+        return override
+    results_dir = Path.home() / "Data/openlifu-validation/results"
+    candidates = [
+        results_dir / f"{subject}_spatial10mm_gladys_nnunet_corrected_timegated.json",
+        results_dir / f"{subject}_spatial_gladys_nnunet_corrected_timegated.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"No spatial-search sidecar found for {subject}; tried: "
+        + ", ".join(str(c) for c in candidates)
+    )
+
+
+def _load_peak_mm(sidecar: Path) -> tuple[np.ndarray, dict]:
+    with open(sidecar) as f:
+        d = json.load(f)
+    peak = d.get("spatial_max_world_mm")
+    if peak is None or len(peak) != 3:
+        raise ValueError(
+            f"Sidecar {sidecar} has no usable spatial_max_world_mm field"
+        )
+    return np.array(peak, dtype=float), {
+        "spatial_max_world_mm": peak,
+        "spatial_max_offset_from_target_mm": d.get("spatial_max_offset_from_target_mm"),
+        "spatial_max_sensor_name": d.get("spatial_max_sensor_name"),
+        "target_mm": d.get("target_mm"),
+        "cube_half_extent_mm": d.get("cube_half_extent_mm"),
+    }
 
 
 def main() -> int:
@@ -219,9 +269,30 @@ def main() -> int:
     print(f"\n[3] Array: 64 elements baked to world frame; radius ~{RADIUS_MM:.0f} mm")
 
     # -------------------------------------------------------------------
-    # Build sim grid.
+    # Resolve peak sidecar up front (if --probe-at-peak) so grid can cover
+    # both the target voxel and the peak voxel for the two reciprocal sims.
     # -------------------------------------------------------------------
-    all_points = np.vstack([positions, target_mm[np.newaxis, :]])
+    peak_mm: np.ndarray | None = None
+    peak_meta: dict | None = None
+    if args.probe_at_peak:
+        sidecar = _resolve_peak_sidecar(subject, args.peak_sidecar)
+        peak_mm, peak_meta = _load_peak_mm(sidecar)
+        print(f"\n[peak] sidecar = {sidecar}")
+        print(f"[peak] target_mm (sidecar) = {peak_meta['target_mm']}")
+        print(f"[peak] spatial_max_world_mm = {peak_mm.tolist()}")
+        print(f"[peak] offset_from_target_mm = "
+              f"{peak_meta['spatial_max_offset_from_target_mm']}")
+        print(f"[peak] spatial_max_sensor_name = "
+              f"{peak_meta['spatial_max_sensor_name']}")
+
+    # -------------------------------------------------------------------
+    # Build sim grid. Must contain array elements, nominal target, and
+    # (if probing at peak) the spatial peak.
+    # -------------------------------------------------------------------
+    _pts_list = [positions, target_mm[np.newaxis, :]]
+    if peak_mm is not None:
+        _pts_list.append(peak_mm[np.newaxis, :])
+    all_points = np.vstack(_pts_list)
     grid_min = all_points.min(axis=0) - GRID_MARGIN_MM
     grid_max = all_points.max(axis=0) + GRID_MARGIN_MM
     grid_min = np.floor(grid_min / GRID_SPACING_MM) * GRID_SPACING_MM
@@ -286,8 +357,6 @@ def main() -> int:
         el.get_position(units="m", matrix=matrix) * scl_m_to_coord
         for el in arr.elements
     ])
-    target_pos_raw = np.array(target_mm, dtype=float)  # already in mm, coord_units is mm
-
     coord_axis_arrays = [sim_params.coords[dim].to_numpy() for dim in coord_dims]
     grid_shape_params = tuple(len(c) for c in coord_axis_arrays)
 
@@ -310,45 +379,9 @@ def main() -> int:
           f"(out of {N_ELEMENTS} elements) "
           f"-- voxel collisions: {N_ELEMENTS - n_unique_sensor_vox}")
 
-    # Source = target voxel.
-    target_idx = tuple(
-        int(np.argmin(np.abs(coord_axis_arrays[dim_i] - target_pos_raw[_DIM_IDX[dim_name]])))
-        for dim_i, dim_name in enumerate(coord_dims)
-    )
-    source_mask = np.zeros(grid_shape_params, dtype=int)
-    source_mask[target_idx] = 1
-
-    # t_end like SimulationCorrected.
-    dists_m = np.linalg.norm(element_positions_raw - target_pos_raw, axis=1) * scl_to_m
-    max_dist_m = float(np.max(dists_m))
-    t_end_needed = max_dist_m / C0 * 1.5 + RECIPROCAL_N_CYCLES / FREQ_HZ
-
     # -------------------------------------------------------------------
-    # Run the reciprocal sim (only this one k-wave run).
-    # -------------------------------------------------------------------
-    print(f"\n[6] Reciprocal sim: point source @ target, sensors @ elements ...")
-    print(f"    freq={FREQ_HZ / 1e3:.0f} kHz, cycles={RECIPROCAL_N_CYCLES}, "
-          f"cfl={RECIPROCAL_CFL}, t_end={t_end_needed * 1e6:.1f} us")
-    t0 = time.time()
-    sensor_data, dt = run_point_source_simulation(
-        params=sim_params,
-        source_mask=source_mask,
-        sensor_mask=sensor_mask,
-        freq=FREQ_HZ,
-        n_cycles=RECIPROCAL_N_CYCLES,
-        sound_speed_ref=C0,
-        cfl=RECIPROCAL_CFL,
-        gpu=True,
-        t_end=t_end_needed,
-    )
-    t_sim = time.time() - t0
-    Nt, n_cols = sensor_data.shape
-    print(f"    Reciprocal sim done in {t_sim:.1f}s "
-          f"(sensor_data shape={sensor_data.shape}, dt={dt * 1e9:.2f} ns)")
-
-    # -------------------------------------------------------------------
-    # Map sensor_indices (coord_dims order) -> Fortran-order column in
-    # xyz-transposed mask (exactly like SimulationCorrected does).
+    # Precompute the static reciprocal-sim infrastructure once (sensor
+    # mask, fortran-order mapping) so two probe-position runs share it.
     # -------------------------------------------------------------------
     perm_to_xyz = [coord_dims.index(d) for d in ["x", "y", "z"]]
     sensor_mask_xyz = np.transpose(sensor_mask, perm_to_xyz)
@@ -370,169 +403,200 @@ def main() -> int:
     sorted_nonzero = [item[1] for item in nonzero_with_fortran]
     voxel_to_col = {idx: col for col, idx in enumerate(sorted_nonzero)}
 
-    # -------------------------------------------------------------------
-    # Pull per-element columns out of sensor_data (xyz Fortran order).
-    # -------------------------------------------------------------------
-    per_element_signals = np.zeros((N_ELEMENTS, Nt), dtype=sensor_data.dtype)
-    for el_i, sensor_idx in enumerate(sensor_indices):
-        sensor_idx_xyz = tuple(sensor_idx[i] for i in perm_to_xyz)
-        col = voxel_to_col[sensor_idx_xyz]
-        per_element_signals[el_i] = sensor_data[:, col]
-
     c_max = float(np.max(sim_params["sound_speed"].to_numpy()))
     c_max = max(c_max, C0)
 
-    dists_raw = np.linalg.norm(element_positions_raw - target_pos_raw, axis=1)
+    def run_cf_for_probe(probe_mm: np.ndarray, label: str) -> dict:
+        """Run reciprocal sim with virtual source at probe_mm and compute both
+        legacy and corrected CFs at that probe. Returns a dict with both."""
+        probe_pos_raw = np.array(probe_mm, dtype=float)  # mm (coord_units is mm)
 
-    # -------------------------------------------------------------------
-    # (A) Legacy CF: per-element envelope-peak amplitude + analytic-signal
-    #     phase at that same sample, median-centered. Kept for reference.
-    # -------------------------------------------------------------------
-    print(f"\n[7a] Legacy CF (envelope-peak-per-element, median-centered) ...")
-    legacy = _legacy_coherence_factor(
-        per_element_signals=per_element_signals,
-        dt=dt,
-        element_positions_raw=element_positions_raw,
-        target_pos_raw=target_pos_raw,
-        freq_hz=FREQ_HZ,
-        scl_to_m=scl_to_m,
-        c_max=c_max,
-    )
-
-    # -------------------------------------------------------------------
-    # (B) Corrected CF: bandpass + narrowband projection onto a carrier
-    #     referenced to each element's own arrival time. After the
-    #     reciprocal-sim delay correction, all arrival times map to the
-    #     same common focal time, so the resulting complex coefficients
-    #     sum coherently at that one sample. CF = |sum c_i|/sum |c_i|.
-    # -------------------------------------------------------------------
-    print(f"\n[7b] Corrected CF (common-focal-time, bandpass + narrowband projection) ...")
-    corrected = _common_focal_time_coherence_factor(
-        per_element_signals=per_element_signals,
-        dt=dt,
-        element_positions_raw=element_positions_raw,
-        target_pos_raw=target_pos_raw,
-        freq_hz=FREQ_HZ,
-        n_cycles=RECIPROCAL_N_CYCLES,
-        scl_to_m=scl_to_m,
-        c_max=c_max,
-    )
-
-    # -------------------------------------------------------------------
-    # Report both.
-    # -------------------------------------------------------------------
-    print("\n" + "=" * 78)
-    print(" COHERENCE FACTOR RESULTS")
-    print("=" * 78)
-    print(f"  Legacy CF    (envelope-peak-per-element, median-centered):")
-    print(f"    CF           = {legacy['CF']:.4f}")
-    print(f"    20*log10(CF) = {legacy['CF_db']:+.2f} dB")
-    print(f"  Corrected CF (common focal time, narrowband projection, 10% bandpass):")
-    print(f"    CF           = {corrected['CF']:.4f}")
-    print(f"    20*log10(CF) = {corrected['CF_db']:+.2f} dB")
-    delta = corrected['CF'] - legacy['CF']
-    delta_db = corrected['CF_db'] - legacy['CF_db']
-    print(f"  Delta (corrected - legacy): {delta:+.4f}  ({delta_db:+.2f} dB)")
-    if abs(delta) <= 0.05:
-        print(f"  -> Within 0.05 -> legacy approach was fine as a proxy.")
-    else:
-        print(f"  -> Diverge beyond 0.05 -> legacy approach was NOT interchangeable.")
-
-    # ---- Amplitude histograms for both, ten bins each.
-    for tag, res in (("LEGACY", legacy), ("CORRECTED", corrected)):
-        amps = res["amplitudes"]
-        amp_mean = float(np.mean(amps))
-        amp_std = float(np.std(amps))
-        amp_min = float(np.min(amps))
-        amp_max = float(np.max(amps))
-        print(f"\n  {tag}: amplitude distribution across 64 elements:")
-        print(f"    mean={amp_mean:.3g}  std={amp_std:.3g}  min={amp_min:.3g}  max={amp_max:.3g}")
-        print(f"    dynamic range (max/min) = {amp_max / max(amp_min, 1e-30):.2f}x")
-        amp_bins = np.linspace(amp_min, amp_max, 11) if amp_max > amp_min else np.linspace(0, 1, 11)
-        amp_hist, _ = np.histogram(amps, bins=amp_bins)
-        print("    hist (edges -> count):")
-        for lo, hi, c in zip(amp_bins[:-1], amp_bins[1:], amp_hist):
-            bar = "#" * int(c)
-            print(f"      [{lo:>10.3g} .. {hi:<10.3g}] {c:>3d} {bar}")
-
-    # ---- Phase histogram (CORRECTED). Phases relative to common focal time.
-    phases_c = corrected["phases"]
-    amps_c = corrected["amplitudes"]
-    a_sum_c = float(np.sum(amps_c))
-    w_c = amps_c / a_sum_c if a_sum_c > 0 else np.ones_like(amps_c) / len(amps_c)
-    mean_cos_c = float(np.sum(w_c * np.cos(phases_c)))
-    mean_sin_c = float(np.sum(w_c * np.sin(phases_c)))
-    R_c = float(np.sqrt(mean_cos_c ** 2 + mean_sin_c ** 2))
-    circ_std_w_c = float(np.sqrt(-2.0 * np.log(max(R_c, 1e-12))))
-
-    print("\n  CORRECTED: phase distribution (referenced to common focal time) [rad]:")
-    print(f"    circular std, amplitude-weighted = {circ_std_w_c:.4f} rad "
-          f"({circ_std_w_c / (2 * np.pi):.4f} cycles)")
-    print(f"    circular mean resultant R         = {R_c:.4f}  (= corrected CF)")
-    ph_bins = np.linspace(-np.pi, np.pi, 13)
-    ph_hist, _ = np.histogram(phases_c, bins=ph_bins)
-    print("    hist (rad edges -> count):")
-    for lo, hi, c in zip(ph_bins[:-1], ph_bins[1:], ph_hist):
-        bar = "#" * int(c)
-        print(f"      [{lo:>+5.2f} .. {hi:<+5.2f}] {c:>3d} {bar}")
-
-    # ---- Per-element table (CORRECTED).
-    print("\n  Per-element details (CORRECTED; el, dist_mm, a_i, phi_rad, phi_cycles):")
-    for el_i in range(N_ELEMENTS):
-        d_mm = float(dists_raw[el_i])
-        print(f"    el={el_i:02d}  d={d_mm:6.2f}mm  a={amps_c[el_i]:.3g}  "
-              f"phi={phases_c[el_i]:+.3f}rad  ({phases_c[el_i] / (2 * np.pi):+.3f} cyc)")
-
-    # -------------------------------------------------------------------
-    # Physical-interpretation block. The corrected CF is the one that
-    # actually represents coherent summation at the common focal time.
-    # -------------------------------------------------------------------
-    CF_primary = corrected["CF"]
-    CF_primary_db = corrected["CF_db"]
-    print("\n" + "=" * 78)
-    print(" PHYSICAL INTERPRETATION")
-    print("=" * 78)
-    print(f"  Primary CF (physical)    = {CF_primary:.4f}  (common-focal-time, narrowband projection)")
-    print(f"  20*log10(CF_corrected)   = {CF_primary_db:+.2f} dB  "
-          f"(pressure-amplitude loss from spatial decoherence at focus)")
-    print(f"  Legacy CF (reference)    = {legacy['CF']:.4f}  ({legacy['CF_db']:+.2f} dB)")
-    if np.isfinite(CF_primary_db):
-        residual = 20.0 - (-CF_primary_db)
-        verdict = "CONFIRMED" if abs(residual) <= 3.0 else (
-            "PARTIAL" if -CF_primary_db > 10.0 else "NOT SUPPORTED"
+        # Source = probe voxel.
+        probe_idx = tuple(
+            int(np.argmin(np.abs(coord_axis_arrays[dim_i] - probe_pos_raw[_DIM_IDX[dim_name]])))
+            for dim_i, dim_name in enumerate(coord_dims)
         )
-        print(f"  Target unexplained gap   = 20 dB")
-        print(f"  CF-attributed loss       = {-CF_primary_db:.2f} dB")
-        print(f"  residual after CF        = {residual:+.2f} dB   verdict: {verdict}")
+        source_mask_local = np.zeros(grid_shape_params, dtype=int)
+        source_mask_local[probe_idx] = 1
 
-    # Summary line for grep-friendliness.
-    # Additional per-element stats needed for cross-subject comparison table.
-    amps_c = corrected["amplitudes"]
-    phases_c_full = corrected["phases"]
-    amp_std_corr = float(np.std(amps_c))
-    amp_mean_corr = float(np.mean(amps_c))
-    a_sum_corr = float(np.sum(amps_c))
-    if a_sum_corr > 0:
-        w_corr = amps_c / a_sum_corr
-    else:
-        w_corr = np.ones_like(amps_c) / len(amps_c)
-    mc = float(np.sum(w_corr * np.cos(phases_c_full)))
-    ms = float(np.sum(w_corr * np.sin(phases_c_full)))
-    R_weighted = float(np.sqrt(mc ** 2 + ms ** 2))
-    phase_std_weighted_rad = float(np.sqrt(-2.0 * np.log(max(R_weighted, 1e-12))))
-    phase_std_weighted_cyc = phase_std_weighted_rad / (2.0 * np.pi)
+        # Sanity: report snapped-voxel coordinate vs requested probe.
+        snapped_mm = np.array([
+            coord_axis_arrays[dim_i][probe_idx[dim_i]]
+            for dim_i in range(len(coord_dims))
+        ])
+        # coord_dims order may differ from xyz order; reorder for display.
+        snapped_xyz = np.array([
+            snapped_mm[coord_dims.index(dn)] for dn in ["x", "y", "z"]
+        ])
+        print(f"\n[probe:{label}] requested probe_mm={probe_pos_raw.tolist()}")
+        print(f"[probe:{label}] snapped voxel (xyz)={snapped_xyz.tolist()}  "
+              f"(|delta|={np.linalg.norm(snapped_xyz - probe_pos_raw):.3f} mm)")
 
-    print("\n" + "=" * 78)
-    print(f" SUMMARY SUBJECT={subject}  "
-          f"CF_corrected={corrected['CF']:.4f} "
-          f"20log10(CF_corrected)={corrected['CF_db']:+.2f}dB  "
-          f"CF_legacy={legacy['CF']:.4f} "
-          f"20log10(CF_legacy)={legacy['CF_db']:+.2f}dB  "
-          f"amp_mean={amp_mean_corr:.4g} amp_std={amp_std_corr:.4g} "
-          f"phase_std_w_rad={phase_std_weighted_rad:.4f} "
-          f"phase_std_w_cyc={phase_std_weighted_cyc:.4f}  "
-          f"PHYSICAL=CORRECTED")
-    print("=" * 78)
+        # t_end like SimulationCorrected.
+        dists_m = np.linalg.norm(element_positions_raw - probe_pos_raw, axis=1) * scl_to_m
+        max_dist_m = float(np.max(dists_m))
+        t_end_needed = max_dist_m / C0 * 1.5 + RECIPROCAL_N_CYCLES / FREQ_HZ
+
+        print(f"\n[6:{label}] Reciprocal sim: point source @ {label}, sensors @ elements ...")
+        print(f"    freq={FREQ_HZ / 1e3:.0f} kHz, cycles={RECIPROCAL_N_CYCLES}, "
+              f"cfl={RECIPROCAL_CFL}, t_end={t_end_needed * 1e6:.1f} us")
+        t0 = time.time()
+        sensor_data, dt = run_point_source_simulation(
+            params=sim_params,
+            source_mask=source_mask_local,
+            sensor_mask=sensor_mask,
+            freq=FREQ_HZ,
+            n_cycles=RECIPROCAL_N_CYCLES,
+            sound_speed_ref=C0,
+            cfl=RECIPROCAL_CFL,
+            gpu=True,
+            t_end=t_end_needed,
+        )
+        t_sim = time.time() - t0
+        Nt, n_cols = sensor_data.shape
+        print(f"    Reciprocal sim done in {t_sim:.1f}s "
+              f"(sensor_data shape={sensor_data.shape}, dt={dt * 1e9:.2f} ns)")
+
+        # Pull per-element columns.
+        per_element_signals = np.zeros((N_ELEMENTS, Nt), dtype=sensor_data.dtype)
+        for el_i, sensor_idx in enumerate(sensor_indices):
+            sensor_idx_xyz = tuple(sensor_idx[i] for i in perm_to_xyz)
+            col = voxel_to_col[sensor_idx_xyz]
+            per_element_signals[el_i] = sensor_data[:, col]
+
+        print(f"\n[7a:{label}] Legacy CF (envelope-peak-per-element, median-centered) ...")
+        legacy = _legacy_coherence_factor(
+            per_element_signals=per_element_signals,
+            dt=dt,
+            element_positions_raw=element_positions_raw,
+            target_pos_raw=probe_pos_raw,
+            freq_hz=FREQ_HZ,
+            scl_to_m=scl_to_m,
+            c_max=c_max,
+        )
+
+        print(f"\n[7b:{label}] Corrected CF (common-focal-time, bandpass + narrowband projection) ...")
+        corrected = _common_focal_time_coherence_factor(
+            per_element_signals=per_element_signals,
+            dt=dt,
+            element_positions_raw=element_positions_raw,
+            target_pos_raw=probe_pos_raw,
+            freq_hz=FREQ_HZ,
+            n_cycles=RECIPROCAL_N_CYCLES,
+            scl_to_m=scl_to_m,
+            c_max=c_max,
+        )
+
+        # Reporting block (per-probe).
+        print("\n" + "=" * 78)
+        print(f" COHERENCE FACTOR RESULTS  [probe={label}]")
+        print("=" * 78)
+        print(f"  Legacy CF    (envelope-peak-per-element, median-centered):")
+        print(f"    CF           = {legacy['CF']:.4f}")
+        print(f"    20*log10(CF) = {legacy['CF_db']:+.2f} dB")
+        print(f"  Corrected CF (common focal time, narrowband projection, 10% bandpass):")
+        print(f"    CF           = {corrected['CF']:.4f}")
+        print(f"    20*log10(CF) = {corrected['CF_db']:+.2f} dB")
+        delta = corrected['CF'] - legacy['CF']
+        delta_db = corrected['CF_db'] - legacy['CF_db']
+        print(f"  Delta (corrected - legacy): {delta:+.4f}  ({delta_db:+.2f} dB)")
+
+        # Amplitude histograms.
+        for tag, res in (("LEGACY", legacy), ("CORRECTED", corrected)):
+            amps = res["amplitudes"]
+            amp_mean = float(np.mean(amps))
+            amp_std = float(np.std(amps))
+            amp_min = float(np.min(amps))
+            amp_max = float(np.max(amps))
+            print(f"\n  {tag} [probe={label}]: amplitude distribution across 64 elements:")
+            print(f"    mean={amp_mean:.3g}  std={amp_std:.3g}  min={amp_min:.3g}  max={amp_max:.3g}")
+            print(f"    dynamic range (max/min) = {amp_max / max(amp_min, 1e-30):.2f}x")
+
+        # Phase stats (corrected).
+        phases_c_full = corrected["phases"]
+        amps_c = corrected["amplitudes"]
+        a_sum_corr = float(np.sum(amps_c))
+        if a_sum_corr > 0:
+            w_corr = amps_c / a_sum_corr
+        else:
+            w_corr = np.ones_like(amps_c) / len(amps_c)
+        mc = float(np.sum(w_corr * np.cos(phases_c_full)))
+        ms = float(np.sum(w_corr * np.sin(phases_c_full)))
+        R_weighted = float(np.sqrt(mc ** 2 + ms ** 2))
+        phase_std_weighted_rad = float(np.sqrt(-2.0 * np.log(max(R_weighted, 1e-12))))
+        phase_std_weighted_cyc = phase_std_weighted_rad / (2.0 * np.pi)
+
+        amp_mean_corr = float(np.mean(amps_c))
+        amp_std_corr = float(np.std(amps_c))
+
+        # Grep-friendly summary line; includes probe label.
+        print("\n" + "=" * 78)
+        print(f" SUMMARY SUBJECT={subject} PROBE={label}  "
+              f"CF_corrected={corrected['CF']:.4f} "
+              f"20log10(CF_corrected)={corrected['CF_db']:+.2f}dB  "
+              f"CF_legacy={legacy['CF']:.4f} "
+              f"20log10(CF_legacy)={legacy['CF_db']:+.2f}dB  "
+              f"amp_mean={amp_mean_corr:.4g} amp_std={amp_std_corr:.4g} "
+              f"phase_std_w_rad={phase_std_weighted_rad:.4f} "
+              f"phase_std_w_cyc={phase_std_weighted_cyc:.4f}  "
+              f"PHYSICAL=CORRECTED")
+        print("=" * 78)
+
+        return dict(
+            label=label,
+            probe_mm=probe_pos_raw,
+            legacy=legacy,
+            corrected=corrected,
+            sim_seconds=t_sim,
+        )
+
+    # -------------------------------------------------------------------
+    # Run at nominal target (always).
+    # -------------------------------------------------------------------
+    results: dict[str, dict] = {}
+    results["TARGET"] = run_cf_for_probe(target_mm, "TARGET")
+
+    # -------------------------------------------------------------------
+    # Run at spatial peak (optional).
+    # -------------------------------------------------------------------
+    if peak_mm is not None:
+        results["PEAK"] = run_cf_for_probe(peak_mm, "PEAK")
+
+        # Cross-probe summary.
+        cf_tgt = results["TARGET"]["corrected"]["CF"]
+        cf_tgt_db = results["TARGET"]["corrected"]["CF_db"]
+        cf_pk = results["PEAK"]["corrected"]["CF"]
+        cf_pk_db = results["PEAK"]["corrected"]["CF_db"]
+        off_mm = float(np.linalg.norm(peak_mm - target_mm))
+        print("\n" + "=" * 78)
+        print(f" PEAK-vs-TARGET CF COMPARISON for {subject}")
+        print("=" * 78)
+        print(f"  nominal target_mm         = {target_mm.tolist()}")
+        print(f"  spatial peak_mm           = {peak_mm.tolist()}")
+        print(f"  peak-target offset [mm]   = {off_mm:.3f}")
+        print(f"  CF @ TARGET (corrected)   = {cf_tgt:.4f}  "
+              f"({cf_tgt_db:+.2f} dB)")
+        print(f"  CF @ PEAK   (corrected)   = {cf_pk:.4f}  "
+              f"({cf_pk_db:+.2f} dB)")
+        delta_cf = cf_pk - cf_tgt
+        delta_cf_db = cf_pk_db - cf_tgt_db
+        print(f"  delta CF (peak - target)  = {delta_cf:+.4f}  "
+              f"({delta_cf_db:+.2f} dB)")
+        if delta_cf > 0:
+            print("  -> PEAK CF is HIGHER than TARGET CF: focus is more coherent where it lands.")
+        else:
+            print("  -> PEAK CF is NOT higher than TARGET CF.")
+        print("=" * 78)
+
+        # Grep-friendly combined line.
+        print(f" SUMMARY_PEAK_VS_TARGET SUBJECT={subject}  "
+              f"peak_offset_mm={off_mm:.3f}  "
+              f"CF_at_target={cf_tgt:.4f} "
+              f"20log10_CF_at_target={cf_tgt_db:+.2f}dB  "
+              f"CF_at_peak={cf_pk:.4f} "
+              f"20log10_CF_at_peak={cf_pk_db:+.2f}dB  "
+              f"delta_CF={delta_cf:+.4f} delta_CF_dB={delta_cf_db:+.2f}dB")
+        print("=" * 78)
 
     print(f"\nTotal elapsed: {time.time() - t_total:.1f}s")
     return 0
