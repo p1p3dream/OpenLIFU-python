@@ -162,11 +162,13 @@ class ComplexWeighted(DelayMethod):
         """Return per-element ``(delays, apod)`` from the narrowband complex weights.
 
         The returned ``delays`` are absolute transmit times: the narrowband
-        phase delay (wrapped within one period of ``f0``, so magnitude is at
-        most ``1/(2*f0)``) is composed with the nominal geometric time-of-flight
-        baseline from :class:`Direct` and biased up so ``min(delays) == 0``. This
-        keeps all per-element delays non-negative, as required by the transmit
-        path. In the pure-phase limit (all phases zero) the result matches
+        phase *correction* (the difference between the measured DFT phase and
+        the expected geometric phase, wrapped to ``(-pi, pi]``, so magnitude
+        is at most ``1/(2*f0)``) is composed with the nominal geometric
+        time-of-flight baseline from :class:`Direct` and biased up so
+        ``min(delays) == 0``. This keeps all per-element delays non-negative,
+        as required by the transmit path. In the pure-phase limit (all phases
+        equal to their geometric expectation) the result matches
         :meth:`Direct.calc_delays` to within floating-point noise.
 
         Falls back to Direct (geometric) delays with unit amplitudes if k-wave
@@ -187,7 +189,14 @@ class ComplexWeighted(DelayMethod):
             amplitudes, phases, f0 = self._run_reciprocal_simulation_complex(
                 arr, target, params, transform,
             )
-            phase_delays, apod = self._weights_from_coefficients(amplitudes, phases, f0)
+
+            geometric_phases = self._compute_geometric_phases(
+                arr, target, params, f0, transform,
+            )
+
+            phase_delays, apod = self._weights_from_coefficients(
+                amplitudes, phases, f0, geometric_phases=geometric_phases,
+            )
             delays = self._compose_with_geometric(
                 phase_delays, arr, target, params, transform,
             )
@@ -217,15 +226,16 @@ class ComplexWeighted(DelayMethod):
         params: xa.Dataset,
         transform: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Compose narrowband phase delays with a geometric TOF baseline.
+        """Compose narrowband phase correction delays with a geometric TOF baseline.
 
         The geometric baseline is computed the same way :class:`Direct` does
         (``max(TOF) - TOF_i``), which is non-negative by construction. The
-        phase perturbation is at most ``1/(2*f0)`` in magnitude because it
-        comes from a phase wrapped to ``(-pi, pi]``; after summing we still
-        bias the whole array up by ``min(delays)`` so the minimum element
-        delay is exactly zero. The result is a non-negative array suitable
-        for direct use as a transmit delay vector.
+        phase correction is the difference between the measured DFT phase and
+        the expected geometric phase, wrapped to ``(-pi, pi]``, so its
+        magnitude is at most ``1/(2*f0)``. After summing we still bias the
+        whole array up by ``min(delays)`` so the minimum element delay is
+        exactly zero. The result is a non-negative array suitable for direct
+        use as a transmit delay vector.
         """
         from openlifu.bf.delay_methods.direct import Direct
 
@@ -245,13 +255,59 @@ class ComplexWeighted(DelayMethod):
     # Internals
     # ------------------------------------------------------------------
 
+    def _compute_geometric_phases(
+        self,
+        arr: Transducer,
+        target: Point,
+        params: xa.Dataset | None,
+        f0: float,
+        transform: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Compute expected geometric phase per element: ``-2*pi*f0*(dist/c)``.
+
+        Uses the same reference sound speed that :class:`Direct` would select
+        from ``params``, so the geometric phase is consistent with the
+        geometric delay baseline added by :meth:`_compose_with_geometric`.
+        """
+        if params is not None and 'sound_speed' in params and 'ref_value' in params['sound_speed'].attrs:
+            c_ref = float(params['sound_speed'].attrs['ref_value'])
+        else:
+            c_ref = self.c0
+        matrix = np.asarray(transform, dtype=float) if transform is not None else np.eye(4)
+        target_pos = target.get_position(units="m")
+        dists_m = np.array([
+            el.distance_to_point(target_pos, units="m", matrix=matrix)
+            for el in arr.elements
+        ])
+        tof = dists_m / c_ref
+        return -2.0 * np.pi * f0 * tof
+
     @staticmethod
     def _weights_from_coefficients(
         amplitudes: np.ndarray,
         phases: np.ndarray,
         f0: float,
+        geometric_phases: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Convert per-element (a_i, phi_i) complex coefficients to (delays, apod)."""
+        """Convert per-element (a_i, phi_i) complex coefficients to (delays, apod).
+
+        Parameters
+        ----------
+        amplitudes : array
+            Per-element DFT coefficient magnitudes.
+        phases : array
+            Per-element DFT coefficient phases (radians). These encode the
+            total propagation phase (geometric + aberration).
+        f0 : float
+            Operating frequency in Hz.
+        geometric_phases : array or None
+            Expected geometric phase per element: ``-2*pi*f0*(dist_i / c0)``.
+            When provided, only the phase *correction* (measured minus
+            geometric) is wrapped to (-pi, pi] before converting to a delay.
+            This avoids aliasing multi-cycle geometric propagation into a
+            single period, which is critical when the geometric time-of-flight
+            spread exceeds half a period of f0.
+        """
         amplitudes = np.asarray(amplitudes, dtype=float)
         phases = np.asarray(phases, dtype=float)
 
@@ -261,10 +317,17 @@ class ComplexWeighted(DelayMethod):
         else:
             apod = np.ones_like(amplitudes)
 
-        # delay_i = -phi_i / (2 * pi * f0); wrap phases into (-pi, pi] first so
-        # the resulting delay magnitudes sit in one period.
-        wrapped = np.angle(np.exp(1j * phases))
-        delays = -wrapped / (2 * np.pi * f0)
+        if geometric_phases is not None:
+            geometric_phases = np.asarray(geometric_phases, dtype=float)
+            # Wrap only the small correction (measured - geometric) so that
+            # multi-cycle geometric delays are not aliased into one period.
+            correction = np.angle(np.exp(1j * (phases - geometric_phases)))
+            delays = -correction / (2 * np.pi * f0)
+        else:
+            # Legacy path: wrap total phase (correct only when geometric TOF
+            # spread is less than half a period of f0).
+            wrapped = np.angle(np.exp(1j * phases))
+            delays = -wrapped / (2 * np.pi * f0)
         return delays, apod
 
     @staticmethod

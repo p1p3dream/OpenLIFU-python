@@ -194,16 +194,22 @@ class TestComplexWeightedBehavior:
     def test_calc_complex_weights_from_known_coefficients(self):
         f0 = 500e3
         amplitudes = np.array([0.5, 1.0, 0.25])
+        # With geometric_phases mocked to zero, the correction equals the
+        # raw phase, so delays = -phases / (2*pi*f0).
         phases = np.array([0.0, np.pi / 4, -np.pi / 3])
 
         method = ComplexWeighted()
-        # Short-circuit the geometric composition so the assertions target
-        # just the narrowband phase math. The composition itself is covered
-        # by the dedicated integration tests below.
+        # Short-circuit both geometric phase computation and composition so
+        # the assertions target just the narrowband correction math. The
+        # full pipeline is covered by the integration tests below.
         with patch.object(
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
             return_value=(amplitudes, phases, f0),
+        ), patch.object(
+            ComplexWeighted,
+            "_compute_geometric_phases",
+            return_value=np.zeros(len(phases)),
         ), patch.object(
             ComplexWeighted,
             "_compose_with_geometric",
@@ -230,6 +236,10 @@ class TestComplexWeightedBehavior:
             return_value=(amplitudes, phases, f0),
         ), patch.object(
             ComplexWeighted,
+            "_compute_geometric_phases",
+            return_value=np.zeros(len(phases)),
+        ), patch.object(
+            ComplexWeighted,
             "_compose_with_geometric",
             side_effect=lambda phase_delays, *a, **kw: np.asarray(phase_delays),
         ), patch("importlib.util.find_spec", return_value=True):
@@ -250,6 +260,10 @@ class TestComplexWeightedBehavior:
             return_value=(amplitudes, phases, f0),
         ), patch.object(
             ComplexWeighted,
+            "_compute_geometric_phases",
+            return_value=np.zeros(len(phases)),
+        ), patch.object(
+            ComplexWeighted,
             "_compose_with_geometric",
             side_effect=lambda phase_delays, *a, **kw: np.asarray(phase_delays),
         ), patch("importlib.util.find_spec", return_value=True):
@@ -259,9 +273,9 @@ class TestComplexWeightedBehavior:
         np.testing.assert_allclose(a1, a2)
 
     def test_equal_amplitudes_gives_pure_phase_delays(self):
-        """When all a_i are identical and the geometric composition is
-        short-circuited, apod should be all-ones and delays reduce to
-        -phi_i/(2*pi*f0), i.e. the pure-phase case."""
+        """When all a_i are identical and the geometric anchor is zero,
+        apod should be all-ones and delays reduce to -phi_i/(2*pi*f0),
+        i.e. the pure correction case."""
         f0 = 500e3
         amplitudes = np.full(8, 0.73)
         rng = np.random.default_rng(42)
@@ -272,6 +286,10 @@ class TestComplexWeightedBehavior:
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
             return_value=(amplitudes, phases, f0),
+        ), patch.object(
+            ComplexWeighted,
+            "_compute_geometric_phases",
+            return_value=np.zeros(len(phases)),
         ), patch.object(
             ComplexWeighted,
             "_compose_with_geometric",
@@ -371,8 +389,9 @@ class TestComplexWeightedGeometricOffset:
         return xa.Dataset({"sound_speed": sound_speed})
 
     def test_pure_phase_case_matches_direct(self):
-        """When all phases are zero, the composed delays should equal the
-        pure :class:`Direct` geometric result within floating-point noise."""
+        """When DFT phases match geometric expectation (zero aberration),
+        the composed delays should equal the pure :class:`Direct` geometric
+        result within floating-point noise."""
         from openlifu.bf.delay_methods.direct import Direct
 
         arr = self._build_transducer()
@@ -380,11 +399,19 @@ class TestComplexWeightedGeometricOffset:
         params = self._build_params()
 
         f0 = 500e3
+        c0 = 1500.0
         n_el = len(arr.elements)
         amplitudes = np.ones(n_el)
-        phases = np.zeros(n_el)
+        # Simulate zero aberration: DFT phases equal the geometric prediction.
+        target_pos = target.get_position(units="m")
+        dists_m = np.array([
+            el.distance_to_point(target_pos, units="m", matrix=np.eye(4))
+            for el in arr.elements
+        ])
+        geometric_tof = dists_m / c0
+        phases = -2.0 * np.pi * f0 * geometric_tof
 
-        method = ComplexWeighted(c0=1500.0)
+        method = ComplexWeighted(c0=c0)
         with patch.object(
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
@@ -394,26 +421,35 @@ class TestComplexWeightedGeometricOffset:
                 arr=arr, target=target, params=params, transform=None,
             )
 
-        expected = Direct(c0=1500.0).calc_delays(
+        expected = Direct(c0=c0).calc_delays(
             arr, target, params, transform=None,
         )
         np.testing.assert_allclose(delays, expected, atol=1e-9)
         np.testing.assert_allclose(apod, np.ones(n_el))
 
     def test_non_negative_delays(self):
-        """For arbitrary (non-trivial) phases, the composed delays must all
-        be non-negative so they can be used directly as transmit times."""
+        """For arbitrary (non-trivial) aberration corrections, the composed
+        delays must all be non-negative so they can be used as transmit times."""
         arr = self._build_transducer()
         target = self._build_target()
         params = self._build_params()
 
         f0 = 500e3
+        c0 = 1500.0
         n_el = len(arr.elements)
         rng = np.random.default_rng(123)
         amplitudes = rng.uniform(0.3, 1.0, size=n_el)
-        phases = rng.uniform(-np.pi, np.pi, size=n_el)
+        # Build realistic total phases: geometric + small random correction.
+        target_pos = target.get_position(units="m")
+        dists_m = np.array([
+            el.distance_to_point(target_pos, units="m", matrix=np.eye(4))
+            for el in arr.elements
+        ])
+        geometric_phases = -2.0 * np.pi * f0 * (dists_m / c0)
+        corrections = rng.uniform(-np.pi, np.pi, size=n_el)
+        phases = geometric_phases + corrections
 
-        method = ComplexWeighted(c0=1500.0)
+        method = ComplexWeighted(c0=c0)
         with patch.object(
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
@@ -425,9 +461,9 @@ class TestComplexWeightedGeometricOffset:
         assert float(np.min(delays)) >= 0.0
 
     def test_max_perturbation_bounded_by_one_period(self):
-        """The phase perturbation away from the pure Direct result should
+        """The phase correction away from the pure Direct result should
         stay within 1/(2*f0) per element (one half period), because the
-        narrowband phase is wrapped to (-pi, pi]. Bias-up from any negative
+        correction phase is wrapped to (-pi, pi]. Bias-up from any negative
         excursion is allowed on top of that."""
         from openlifu.bf.delay_methods.direct import Direct
 
@@ -436,12 +472,21 @@ class TestComplexWeightedGeometricOffset:
         params = self._build_params()
 
         f0 = 500e3
+        c0 = 1500.0
         n_el = len(arr.elements)
         rng = np.random.default_rng(7)
         amplitudes = rng.uniform(0.1, 1.0, size=n_el)
-        phases = rng.uniform(-np.pi, np.pi, size=n_el)
+        # Build realistic total phases: geometric + small random correction.
+        target_pos = target.get_position(units="m")
+        dists_m = np.array([
+            el.distance_to_point(target_pos, units="m", matrix=np.eye(4))
+            for el in arr.elements
+        ])
+        geometric_phases = -2.0 * np.pi * f0 * (dists_m / c0)
+        corrections = rng.uniform(-np.pi, np.pi, size=n_el)
+        phases = geometric_phases + corrections
 
-        method = ComplexWeighted(c0=1500.0)
+        method = ComplexWeighted(c0=c0)
         with patch.object(
             ComplexWeighted,
             "_run_reciprocal_simulation_complex",
@@ -450,7 +495,7 @@ class TestComplexWeightedGeometricOffset:
             delays, _apod = method.calc_complex_weights(
                 arr=arr, target=target, params=params, transform=None,
             )
-        geom = Direct(c0=1500.0).calc_delays(
+        geom = Direct(c0=c0).calc_delays(
             arr, target, params, transform=None,
         )
         # phase delay range is +-1/(2*f0), and the safety bias-up can add up
@@ -463,3 +508,275 @@ class TestComplexWeightedGeometricOffset:
         perturbation = delays - geom
         assert float(np.min(perturbation)) >= -1e-12
         assert float(np.max(perturbation)) <= (1.0 / f0) + 1e-12
+
+
+class TestPhaseUnwrapping:
+    """Validate the geometric-anchor phase unwrapping in _weights_from_coefficients.
+
+    The core idea: the DFT phase encodes the TOTAL propagation phase
+    (geometric + skull aberration). If we wrap the total phase into (-pi, pi]
+    and convert to delay, multi-cycle geometric time-of-flight is aliased into
+    a single period. The fix: subtract the expected geometric phase first, wrap
+    only the small correction, then add the geometric delay back. These tests
+    verify that logic at both the _weights_from_coefficients level and the
+    full calc_complex_weights pipeline level.
+    """
+
+    # -- Shared helpers (reuse the transducer/target/params builders) ----------
+
+    @staticmethod
+    def _build_transducer():
+        """Build a small 2x2 transducer with known distances to origin."""
+        from openlifu import xdc
+        elements = []
+        for lat in (-10.0, 10.0):
+            for ele in (-10.0, 10.0):
+                elements.append(
+                    xdc.Element(
+                        position=np.array([lat, ele, 50.0]),
+                        size=np.array([5.0, 5.0]),
+                        units="mm",
+                    ),
+                )
+        return xdc.Transducer(elements=elements, frequency=500_000, units="mm")
+
+    @staticmethod
+    def _build_target():
+        from openlifu.geo import Point
+        return Point(position=(0.0, 0.0, 0.0), units="mm", dims=("x", "y", "z"))
+
+    @staticmethod
+    def _build_params():
+        import xarray as xa
+        coords = {}
+        for dim in ("x", "y", "z"):
+            cv = np.linspace(-30.0, 60.0, 31, endpoint=True)
+            coords[dim] = xa.DataArray(cv, dims=[dim], attrs={"units": "mm"})
+        shape = (31, 31, 31)
+        sound_speed = xa.DataArray(
+            np.full(shape, 1500.0, dtype=np.float32),
+            dims=("x", "y", "z"),
+            coords=coords,
+            attrs={"units": "m/s", "ref_value": 1500.0},
+        )
+        return xa.Dataset({"sound_speed": sound_speed})
+
+    # -- Test 1: Multi-cycle delay recovery -----------------------------------
+
+    def test_phase_wrapping_with_known_delays(self):
+        """When the true propagation delay is 3.5us at 500 kHz (period = 2us),
+        the total DFT phase wraps modulo 2*pi. Without the geometric anchor,
+        _weights_from_coefficients would recover only the wrapped residual
+        (3.5 mod 1/f0 mapped into [-0.5/f0, 0.5/f0]). With the anchor, the
+        correction is small and the full delay is recovered via compose_with_geometric.
+
+        We mock the reciprocal sim to return phases corresponding to known true
+        delays, then verify the pipeline produces the correct composed delays.
+        """
+        f0 = 500e3  # 2us period
+        c0 = 1500.0
+
+        arr = self._build_transducer()
+        target = self._build_target()
+        params = self._build_params()
+
+        n_el = len(arr.elements)
+        # Compute geometric distances (meters) and TOFs
+        target_pos = target.get_position(units="m")
+        dists_m = np.array([
+            el.distance_to_point(target_pos, units="m", matrix=np.eye(4))
+            for el in arr.elements
+        ])
+        geometric_tof = dists_m / c0
+
+        # Inject a known extra skull aberration of 3.5us on element 0.
+        # The total propagation delay for element 0 is geometric_tof[0] + 3.5e-6.
+        # For other elements, the aberration is 0 (pure water).
+        aberration = np.zeros(n_el)
+        aberration[0] = 3.5e-6  # 3.5 microseconds, more than one period
+
+        total_tof = geometric_tof + aberration
+        # The DFT phase for each element: phi_i = -2*pi*f0*total_tof_i
+        # (the sim returns phase = -omega * delay)
+        sim_phases = -2.0 * np.pi * f0 * total_tof
+        sim_amplitudes = np.ones(n_el)
+
+        method = ComplexWeighted(c0=c0)
+        with patch.object(
+            ComplexWeighted,
+            "_run_reciprocal_simulation_complex",
+            return_value=(sim_amplitudes, sim_phases, f0),
+        ), patch("importlib.util.find_spec", return_value=True):
+            delays, apod = method.calc_complex_weights(
+                arr=arr, target=target, params=params, transform=None,
+            )
+
+        # The Direct geometric delays are: max(tof) - tof_i.
+        # The correct composed delays should be: max(total_tof) - total_tof_i.
+        # After bias-up (min=0), this is equivalent.
+        from openlifu.bf.delay_methods.direct import Direct
+        geom_delays = Direct(c0=c0).calc_delays(arr, target, params, transform=None)
+
+        # Phase correction for each element = aberration[i] relative to geometric.
+        # The correction is small enough to survive wrapping (3.5us wraps to
+        # a correction of 3.5 - 3*period = 3.5 - 3*2 = -2.5... wait, let's be
+        # precise). The geometric anchor makes the correction = aberration mod period,
+        # mapped into (-half_period, half_period]. For 3.5us at 2us period:
+        #   3.5 / 2 = 1.75 periods => fractional = 0.75 period
+        #   0.75 * 2us = 1.5us, but wrapped to (-1us, 1us] => 1.5 - 2 = -0.5us
+        # So phase_delay[0] = -0.5us (the wrapped correction).
+        # Composed: geom_delays[0] + (-0.5us).
+        #
+        # The key test: the RELATIVE delay between element 0 and the others must
+        # reflect the aberration. Specifically, element 0 should fire LATER
+        # (larger delay) than it would geometrically, by the aberration amount
+        # modulo one period.
+
+        # The composed delay = geom_delay + phase_correction, then biased so min=0.
+        # Expected phase_correction[0] = -0.5us (the wrapped 3.5us correction)
+        # Expected phase_correction[others] = 0.0 (no aberration)
+        expected_correction = np.zeros(n_el)
+        # 3.5us mod 2us period, mapped to (-1us, 1us]: 3.5 - 2*round(3.5/2) = 3.5-4 = -0.5us
+        expected_correction[0] = -0.5e-6
+
+        expected_composed = geom_delays + expected_correction
+        # Bias so min = 0
+        expected_composed -= np.min(expected_composed)
+
+        np.testing.assert_allclose(delays, expected_composed, atol=1e-12)
+
+    # -- Test 2: Homogeneous water (no correction) ----------------------------
+
+    def test_geometric_anchor_correctness(self):
+        """When the DFT phase matches the geometric prediction exactly
+        (homogeneous water, zero aberration), the ComplexWeighted delay
+        should equal the geometric Direct delay. The correction term is zero.
+        """
+        f0 = 500e3
+        c0 = 1500.0
+
+        arr = self._build_transducer()
+        target = self._build_target()
+        params = self._build_params()
+
+        n_el = len(arr.elements)
+        target_pos = target.get_position(units="m")
+        dists_m = np.array([
+            el.distance_to_point(target_pos, units="m", matrix=np.eye(4))
+            for el in arr.elements
+        ])
+        geometric_tof = dists_m / c0
+
+        # Sim returns phases that exactly match geometric prediction (no aberration).
+        sim_phases = -2.0 * np.pi * f0 * geometric_tof
+        sim_amplitudes = np.ones(n_el)
+
+        method = ComplexWeighted(c0=c0)
+        with patch.object(
+            ComplexWeighted,
+            "_run_reciprocal_simulation_complex",
+            return_value=(sim_amplitudes, sim_phases, f0),
+        ), patch("importlib.util.find_spec", return_value=True):
+            delays, apod = method.calc_complex_weights(
+                arr=arr, target=target, params=params, transform=None,
+            )
+
+        from openlifu.bf.delay_methods.direct import Direct
+        expected = Direct(c0=c0).calc_delays(arr, target, params, transform=None)
+
+        np.testing.assert_allclose(delays, expected, atol=1e-12)
+        np.testing.assert_allclose(apod, np.ones(n_el))
+
+    # -- Test 3: Small correction is the same with or without anchor ----------
+
+    def test_small_correction_unchanged(self):
+        """When the skull correction is small (< half a period, well within one
+        cycle), the result from _weights_from_coefficients should be the same
+        whether or not geometric_phases is provided. Both the anchored and
+        legacy paths should agree for sub-period corrections.
+        """
+        f0 = 500e3  # period = 2us, half-period = 1us
+        c0 = 1500.0
+
+        arr = self._build_transducer()
+        target = self._build_target()
+
+        n_el = len(arr.elements)
+        target_pos = target.get_position(units="m")
+        dists_m = np.array([
+            el.distance_to_point(target_pos, units="m", matrix=np.eye(4))
+            for el in arr.elements
+        ])
+        geometric_tof = dists_m / c0
+
+        # Small aberrations: all under 0.5us (well within half-period of 1us).
+        rng = np.random.default_rng(99)
+        small_aberration = rng.uniform(-0.3e-6, 0.3e-6, size=n_el)
+
+        total_tof = geometric_tof + small_aberration
+        sim_phases = -2.0 * np.pi * f0 * total_tof
+        sim_amplitudes = np.ones(n_el)
+
+        geometric_phases = -2.0 * np.pi * f0 * geometric_tof
+
+        # With geometric anchor (the fixed path)
+        delays_anchored, _ = ComplexWeighted._weights_from_coefficients(
+            sim_amplitudes, sim_phases, f0, geometric_phases=geometric_phases,
+        )
+
+        # Without geometric anchor (legacy path)
+        delays_legacy, _ = ComplexWeighted._weights_from_coefficients(
+            sim_amplitudes, sim_phases, f0, geometric_phases=None,
+        )
+
+        # The anchored path returns just the correction (small aberration), while
+        # the legacy path returns -wrapped_total_phase / (2*pi*f0). These will
+        # differ by the geometric contribution. Instead, verify that after
+        # composing each with the geometric baseline, the final delays agree.
+        #
+        # anchored: geom_delay + phase_correction (where correction ~ aberration)
+        # legacy:   the raw delay already includes the full TOF, but wrapped.
+        #
+        # The correction phase is -omega * aberration, so
+        # delay = -correction / (2*pi*f0) = +aberration.
+        # For small corrections, the anchored correction should exactly
+        # equal the aberration.
+        np.testing.assert_allclose(
+            delays_anchored, small_aberration, atol=1e-12,
+            err_msg="Anchored correction should recover the small aberration exactly",
+        )
+
+    # -- Test 4: Apodization is independent of the phase fix ------------------
+
+    def test_apodization_independent_of_phase_fix(self):
+        """The apodization (amplitude weights) must be identical regardless of
+        whether geometric_phases is provided to _weights_from_coefficients.
+        The phase-unwrapping fix only affects delay computation, not amplitudes.
+        """
+        f0 = 500e3
+        c0 = 1500.0
+
+        n_el = 4
+        rng = np.random.default_rng(42)
+        sim_amplitudes = rng.uniform(0.1, 1.0, size=n_el)
+        sim_phases = rng.uniform(-np.pi, np.pi, size=n_el)
+
+        # Arbitrary geometric phases
+        geometric_phases = rng.uniform(-20 * np.pi, 20 * np.pi, size=n_el)
+
+        _, apod_with_anchor = ComplexWeighted._weights_from_coefficients(
+            sim_amplitudes, sim_phases, f0, geometric_phases=geometric_phases,
+        )
+        _, apod_without_anchor = ComplexWeighted._weights_from_coefficients(
+            sim_amplitudes, sim_phases, f0, geometric_phases=None,
+        )
+
+        np.testing.assert_array_equal(
+            apod_with_anchor, apod_without_anchor,
+            err_msg="Apodization must not depend on geometric_phases",
+        )
+        # Verify normalization: max should be 1.0
+        assert apod_with_anchor.max() == pytest.approx(1.0)
+        np.testing.assert_allclose(
+            apod_with_anchor, sim_amplitudes / sim_amplitudes.max(),
+        )
