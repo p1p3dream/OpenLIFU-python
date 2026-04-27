@@ -632,15 +632,16 @@ class TestPhaseUnwrapping:
         # (larger delay) than it would geometrically, by the aberration amount
         # modulo one period.
 
-        # The composed delay = geom_delay + phase_correction, then biased so min=0.
-        # Expected phase_correction[0] = -0.5us (the wrapped 3.5us correction)
-        # Expected phase_correction[others] = 0.0 (no aberration)
+        # The composed delay = geom_delay - phase_correction, then biased so min=0.
+        # phase_correction[0] = -0.5us (the wrapped 3.5us excess propagation).
+        # Subtracting a negative correction means element 0 fires LATER, which
+        # is correct: the wrapped phase says it appears 0.5us faster, so we
+        # compensate by delaying it 0.5us.
         expected_correction = np.zeros(n_el)
         # 3.5us mod 2us period, mapped to (-1us, 1us]: 3.5 - 2*round(3.5/2) = 3.5-4 = -0.5us
         expected_correction[0] = -0.5e-6
 
-        expected_composed = geom_delays + expected_correction
-        # Bias so min = 0
+        expected_composed = geom_delays - expected_correction
         expected_composed -= np.min(expected_composed)
 
         np.testing.assert_allclose(delays, expected_composed, atol=1e-12)

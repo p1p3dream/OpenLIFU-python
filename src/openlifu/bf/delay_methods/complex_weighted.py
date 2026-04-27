@@ -226,26 +226,25 @@ class ComplexWeighted(DelayMethod):
         params: xa.Dataset,
         transform: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Compose narrowband phase correction delays with a geometric TOF baseline.
+        """Compose narrowband phase correction with a geometric TOF baseline.
 
-        The geometric baseline is computed the same way :class:`Direct` does
-        (``max(TOF) - TOF_i``), which is non-negative by construction. The
-        phase correction is the difference between the measured DFT phase and
-        the expected geometric phase, wrapped to ``(-pi, pi]``, so its
-        magnitude is at most ``1/(2*f0)``. After summing we still bias the
-        whole array up by ``min(delays)`` so the minimum element delay is
-        exactly zero. The result is a non-negative array suitable for direct
-        use as a transmit delay vector.
+        ``phase_delays[i]`` is the excess propagation time for element *i*
+        relative to the geometric estimate: ``tau_measured - tau_geometric``.
+        A positive value means the actual path is slower than geometric
+        (e.g., skull slows the wave), so the element should fire *earlier*
+        to compensate. We therefore SUBTRACT ``phase_delays`` from the
+        geometric baseline.
+
+        The geometric baseline is ``max(TOF_geo) - TOF_geo_i`` (from
+        :class:`Direct`), which is non-negative. After subtracting the
+        correction, the result is biased so ``min(delays) == 0``.
         """
         from openlifu.bf.delay_methods.direct import Direct
 
         geom_delays = Direct(c0=self.c0).calc_delays(
             arr, target, params, transform=transform,
         )
-        delays = geom_delays + np.asarray(phase_delays, dtype=float)
-        # Safety: if any delay went negative due to the phase perturbation
-        # exceeding the geometric spread in a degenerate case, bias the whole
-        # vector up so min(delays) == 0.
+        delays = geom_delays - np.asarray(phase_delays, dtype=float)
         min_delay = float(np.min(delays))
         if min_delay < 0.0:
             delays = delays - min_delay
@@ -564,9 +563,9 @@ class ComplexWeighted(DelayMethod):
             else:
                 filtered = time_series
 
-            # Locate the arrival-time sample with the same gating logic used by
-            # SimulationCorrected, so the DFT window lines up with the first
-            # coherent wavefront.
+            # Locate the first-arrival sample using threshold detection (same
+            # approach as SimulationCorrected) so the DFT window centers on the
+            # direct wavefront, not late skull reverberations.
             analytic = hilbert(filtered)
             envelope = np.abs(analytic)
             earliest_arrival_s = (
@@ -577,7 +576,22 @@ class ComplexWeighted(DelayMethod):
             gate_start = max(0, int((earliest_arrival_s - 2 * dt) / dt))
             if gate_start >= len(envelope):
                 gate_start = 0
-            arrival_idx = gate_start + int(np.argmax(envelope[gate_start:]))
+            gated_env = envelope[gate_start:]
+            max_env = float(np.max(gated_env)) if gated_env.size else 0.0
+            if max_env == 0:
+                arrival_idx = gate_start
+            else:
+                threshold = 0.1 * max_env
+                above = np.where(gated_env >= threshold)[0]
+                if len(above) == 0:
+                    first_above = 0
+                else:
+                    first_above = int(above[0])
+                win_half = 5
+                win_start = max(0, first_above - win_half)
+                win_end = min(len(gated_env), first_above + win_half + 1)
+                local_peak = win_start + int(np.argmax(gated_env[win_start:win_end]))
+                arrival_idx = gate_start + local_peak
 
             coef = self._extract_narrowband_coefficient(
                 filtered, dt, f0, arrival_idx, self.window_cycles,
