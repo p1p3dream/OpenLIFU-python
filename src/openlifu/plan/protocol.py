@@ -133,7 +133,7 @@ class Protocol:
         delays, delay_method_apod = self.delay_method.calc_delays_and_apod(
             arr, target, params, transform=transform,
         )
-        apod = self.apod_method.calc_apodization(arr, target, params)
+        apod = self.apod_method.calc_apodization(arr, target, params, transform=transform)
         if delay_method_apod is not None:
             # Multiplicative combination: delay-method amplitude weights
             # modulate on top of the protocol's apodization method output.
