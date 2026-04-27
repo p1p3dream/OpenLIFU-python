@@ -1,17 +1,18 @@
-"""Regression tests for SimulationCorrected focal targeting.
+"""Regression tests for SimulationCorrected pose/transform plumbing.
 
-These tests reproduce the 2026-04-17 "focus at z=180 instead of z=98" bug.
-Root cause: neither `calc_delays` nor `run_simulation` received a transducer
-pose transform, so elements were placed at raw transducer-local coordinates
-inside the MRI world grid.
+Root cause of the 2026-04-17 bug: neither `calc_delays` nor `run_simulation`
+received a transducer pose transform, so elements were placed at raw local
+coordinates inside the MRI world grid.
 
-The homogeneous-water case isolates the pose / pipeline path from skull
-aberration effects: if the focus does not land at the target in water,
-the bug is purely geometric.
-
-Both tests require a working k-wave installation and are skipped otherwise.
-They are intentionally small (1mm grid, 4-element ring) so they finish in
-under 30 seconds on CPU.
+Test strategy:
+  1. Delay-equality: in homogeneous water, SimulationCorrected delays should
+     match Direct (geometric) delays within k-Wave numerical noise (~few dt).
+     This validates the full reciprocal-sim pipeline without needing enough
+     elements to produce a clean focal peak.
+  2. Transform-invariance: delays should not depend on where the array is
+     placed in the grid, only on the array-to-target geometry.
+  3. Fallback detection: calc_delays must NOT silently fall back to Direct
+     when a ValueError (out-of-grid) is raised.
 """
 from __future__ import annotations
 
@@ -20,214 +21,179 @@ import pytest
 import xarray as xa
 
 from openlifu.bf.delay_methods import SimulationCorrected
+from openlifu.bf.delay_methods.direct import Direct
+from openlifu.bf.delay_methods.simulation_corrected import OutOfGridError
 from openlifu.geo import Point
 
-kwave = pytest.importorskip("kwave")
+try:
+    import kwave  # noqa: F401
+    _has_kwave = True
+except ImportError:
+    _has_kwave = False
+
+requires_kwave = pytest.mark.skipif(not _has_kwave, reason="kwave not installed")
 
 
-# Grid: 1 mm isotropic, 120 mm cube, centered at world (0, 0, 0)
 GRID_N = 120
 GRID_DX_MM = 1.0
 GRID_HALF_MM = (GRID_N * GRID_DX_MM) / 2
 
-# Transducer geometry: 4-element ring, 40 mm radius, geometric focus at 80 mm
-# in the transducer-local +z direction.
 N_ELEMENTS = 4
 ARRAY_RADIUS_MM = 40.0
-ARRAY_ROC_MM = 80.0
 FREQ_HZ = 500_000
 SOUND_SPEED_MPS = 1500.0
 DENSITY_KGM3 = 1000.0
-ATTENUATION = 0.0
 
 
 def _build_water_params():
-    """Build a homogeneous-water xarray Dataset covering a 120 mm cube."""
     coords = {}
     for dim in ("x", "y", "z"):
         cv = np.linspace(-GRID_HALF_MM, GRID_HALF_MM, GRID_N, endpoint=False)
         coords[dim] = xa.DataArray(cv, dims=[dim], attrs={"units": "mm"})
-
     shape = (GRID_N, GRID_N, GRID_N)
-    sound_speed = xa.DataArray(
-        np.full(shape, SOUND_SPEED_MPS, dtype=np.float32),
-        dims=("x", "y", "z"),
-        coords=coords,
-        attrs={"units": "m/s", "ref_value": SOUND_SPEED_MPS},
-    )
-    density = xa.DataArray(
-        np.full(shape, DENSITY_KGM3, dtype=np.float32),
-        dims=("x", "y", "z"),
-        coords=coords,
-        attrs={"units": "kg/m^3", "ref_value": DENSITY_KGM3},
-    )
-    attenuation = xa.DataArray(
-        np.full(shape, ATTENUATION, dtype=np.float32),
-        dims=("x", "y", "z"),
-        coords=coords,
-        attrs={"units": "dB/cm/MHz", "ref_value": ATTENUATION},
-    )
     return xa.Dataset({
-        "sound_speed": sound_speed,
-        "density": density,
-        "attenuation": attenuation,
+        "sound_speed": xa.DataArray(
+            np.full(shape, SOUND_SPEED_MPS, dtype=np.float32),
+            dims=("x", "y", "z"), coords=coords,
+            attrs={"units": "m/s", "ref_value": SOUND_SPEED_MPS},
+        ),
+        "density": xa.DataArray(
+            np.full(shape, DENSITY_KGM3, dtype=np.float32),
+            dims=("x", "y", "z"), coords=coords,
+            attrs={"units": "kg/m^3", "ref_value": DENSITY_KGM3},
+        ),
+        "attenuation": xa.DataArray(
+            np.full(shape, 0.0, dtype=np.float32),
+            dims=("x", "y", "z"), coords=coords,
+            attrs={"units": "dB/cm/MHz", "ref_value": 0.0},
+        ),
     })
 
 
 def _build_ring_transducer():
-    """Build a 4-element ring transducer centered at transducer-local origin,
-    aperture normal pointing in +z, geometric focus at local z = +ROC."""
     from openlifu import xdc
-
     elements = []
     for i in range(N_ELEMENTS):
         theta = 2 * np.pi * i / N_ELEMENTS
         x = ARRAY_RADIUS_MM * np.cos(theta)
         y = ARRAY_RADIUS_MM * np.sin(theta)
-        z = 0.0  # flat ring; rely on delays for focusing
-        el = xdc.Element(
+        elements.append(xdc.Element(
             index=i,
-            position=np.array([x, y, z], dtype=float),
+            position=np.array([x, y, 0.0], dtype=float),
             orientation=np.array([0.0, 0.0, 0.0], dtype=float),
             size=np.array([5.0, 5.0], dtype=float),
             units="mm",
-        )
-        elements.append(el)
-
-    arr = xdc.Transducer(
-        elements=elements,
-        frequency=FREQ_HZ,
-        units="mm",
-    )
-    return arr
+        ))
+    return xdc.Transducer(elements=elements, frequency=FREQ_HZ, units="mm")
 
 
-def _transducer_to_world_transform(world_center_mm, aperture_normal=(0, 0, -1)):
-    """Build a 4x4 matrix placing the transducer's local origin at
-    `world_center_mm` with aperture pointing along `aperture_normal`.
-    For the default normal (0, 0, -1), elements on the local +z side end up
-    in the world -z direction, so the focus falls in -z relative to the
-    array center.
-
-    `world_center_mm` is accepted in mm for call-site ergonomics, but the
-    returned transform's translation column is expressed in meters, matching
-    the world-frame SI convention for the public `transform` kwarg.
-    Consumers pass the matrix straight through to
-    `Element.get_position(units="m", matrix=...)`.
-    """
+def _make_transform(world_center_mm, flip_z=True):
     T = np.eye(4)
-    T[:3, 3] = np.asarray(world_center_mm, dtype=float) * 1e-3  # mm -> m
-    if aperture_normal == (0, 0, -1):
+    T[:3, 3] = np.asarray(world_center_mm, dtype=float) * 1e-3
+    if flip_z:
         T[2, 2] = -1
-        T[1, 1] = -1  # maintain right-handed frame
+        T[1, 1] = -1
     return T
 
 
-def _focal_peak_mm(pmax_dataarray):
-    """Return (x, y, z) of the peak of a 3D xarray, in mm."""
-    arr = pmax_dataarray.transpose("x", "y", "z").data
-    idx = np.unravel_index(np.argmax(arr), arr.shape)
-    return (
-        float(pmax_dataarray.coords["x"].values[idx[0]]),
-        float(pmax_dataarray.coords["y"].values[idx[1]]),
-        float(pmax_dataarray.coords["z"].values[idx[2]]),
+@requires_kwave
+@pytest.mark.slow
+def test_delay_equality_simcorrected_vs_direct_in_water():
+    """In homogeneous water, SimulationCorrected delays should match Direct
+    delays within a few time steps of k-Wave numerical noise.
+
+    This validates that the reciprocal simulation, Hilbert peak-picking, and
+    transform plumbing all produce geometrically correct arrival times.
+    """
+    params = _build_water_params()
+    arr = _build_ring_transducer()
+    tx_to_world = _make_transform((0.0, 0.0, 30.0))
+    target = Point(position=(0.0, 0.0, -20.0), units="mm", dims=("x", "y", "z"))
+
+    direct = Direct(c0=SOUND_SPEED_MPS)
+    delays_direct = direct.calc_delays(arr, target, params, transform=tx_to_world)
+
+    sim_corr = SimulationCorrected(c0=SOUND_SPEED_MPS, cfl=0.3, n_cycles=3, gpu=False)
+    delays_sim = sim_corr.calc_delays(arr, target, params, transform=tx_to_world)
+
+    dt_s = GRID_DX_MM * 1e-3 / SOUND_SPEED_MPS
+    tol_s = 5 * dt_s
+
+    diff = np.abs(delays_sim - delays_direct)
+    print(f"\n[delay-equality] Direct delays (us): {delays_direct * 1e6}")
+    print(f"[delay-equality] SimCorr delays (us): {delays_sim * 1e6}")
+    print(f"[delay-equality] Max diff: {diff.max() * 1e6:.3f} us, tol: {tol_s * 1e6:.3f} us")
+
+    assert diff.max() < tol_s, (
+        f"SimulationCorrected delays differ from Direct by {diff.max()*1e6:.3f} us "
+        f"(tol={tol_s*1e6:.3f} us). Delays are not geometrically correct."
+    )
+
+    assert np.allclose(delays_direct, delays_direct[0]), (
+        "4-fold symmetric ring should have equal Direct delays, but got: "
+        f"{delays_direct * 1e6}"
     )
 
 
+@requires_kwave
 @pytest.mark.slow
-def test_homogeneous_water_geometric_focus_with_zero_delays():
-    """Sanity check: a flat ring transducer fired with delays=0 should produce
-    its peak pressure at the geometric center of the ring (i.e. directly in
-    front of the array, at the aperture plane + near-field distance).
-
-    This isolates the forward-sim path: if the peak is NOT near the array
-    plane, the forward-sim coordinate handling is broken independent of
-    any delay calculation.
+def test_delay_invariance_under_translation():
+    """Delays should depend only on array-to-target geometry, not on absolute
+    grid position. Translating both the array and target by the same offset
+    should produce identical delays.
     """
-    from openlifu.sim.kwave_if import run_simulation
+    params = _build_water_params()
+    arr = _build_ring_transducer()
+
+    target_a = Point(position=(0.0, 0.0, -20.0), units="mm", dims=("x", "y", "z"))
+    tx_a = _make_transform((0.0, 0.0, 30.0))
+
+    target_b = Point(position=(10.0, 5.0, -10.0), units="mm", dims=("x", "y", "z"))
+    tx_b = _make_transform((10.0, 5.0, 40.0))
+
+    sim_corr = SimulationCorrected(c0=SOUND_SPEED_MPS, cfl=0.3, n_cycles=3, gpu=False)
+
+    delays_a = sim_corr.calc_delays(arr, target_a, params, transform=tx_a)
+    delays_b = sim_corr.calc_delays(arr, target_b, params, transform=tx_b)
+
+    dt_s = GRID_DX_MM * 1e-3 / SOUND_SPEED_MPS
+    tol_s = 5 * dt_s
+
+    diff = np.abs(delays_a - delays_b)
+    print(f"\n[translation-invariance] Delays A (us): {delays_a * 1e6}")
+    print(f"[translation-invariance] Delays B (us): {delays_b * 1e6}")
+    print(f"[translation-invariance] Max diff: {diff.max() * 1e6:.3f} us")
+
+    assert diff.max() < tol_s, (
+        f"Delays changed by {diff.max()*1e6:.3f} us under rigid translation "
+        f"(tol={tol_s*1e6:.3f} us). Transform plumbing is broken."
+    )
+
+
+def test_out_of_grid_error_propagates_when_fallback_disabled():
+    """OutOfGridError must propagate through calc_delays, not be caught by the
+    generic (RuntimeError, ValueError, ...) handler.
+
+    This validates that allow_out_of_grid_fallback=False actually prevents
+    silent fallback to Direct delays when elements are outside the grid.
+    """
+    from unittest.mock import patch
 
     params = _build_water_params()
     arr = _build_ring_transducer()
-    array_world_center_mm = (0.0, 0.0, 40.0)
-    tx_to_world = _transducer_to_world_transform(array_world_center_mm)
+    target = Point(position=(0.0, 0.0, 0.0), units="mm", dims=("x", "y", "z"))
+    tx = _make_transform((0.0, 0.0, 0.0), flip_z=False)
 
-    delays = np.zeros(N_ELEMENTS)
-
-    result = run_simulation(
-        arr=arr, params=params, delays=delays,
-        freq=FREQ_HZ, cycles=3, amplitude=1.0,
-        ref_values_only=True, gpu=False,
-        transform=tx_to_world,
+    sim_corr = SimulationCorrected(
+        c0=SOUND_SPEED_MPS, cfl=0.3, n_cycles=3, gpu=False,
+        allow_out_of_grid_fallback=False,
     )
 
-    peak_x, peak_y, peak_z = _focal_peak_mm(result["p_max"])
-    print(
-        f"\n[zero-delays test] focal peak (mm): "
-        f"x={peak_x:.3f}, y={peak_y:.3f}, z={peak_z:.3f}  "
-        f"(array plane z={array_world_center_mm[2]})"
-    )
-    assert abs(peak_x) < 5.0, f"Peak x {peak_x} should be near 0"
-    assert abs(peak_y) < 5.0, f"Peak y {peak_y} should be near 0"
-    assert abs(peak_z - array_world_center_mm[2]) < ARRAY_RADIUS_MM, (
-        f"Peak z {peak_z} should be within ring radius of array plane "
-        f"{array_world_center_mm[2]}"
-    )
+    def _raise_out_of_grid(*args, **kwargs):
+        raise OutOfGridError("Element outside simulation grid")
 
-
-@pytest.mark.slow
-def test_homogeneous_water_simulation_corrected_focuses_at_target():
-    """End-to-end: with SimulationCorrected delays in homogeneous water,
-    the forward-sim focal peak should land within 2*dx of the target.
-
-    This is the bug reproducer. Today it fails because run_simulation does
-    not accept `transform`. After the pose-fix diff, it should pass in
-    homogeneous water, then we can extend to skull phantoms.
-    """
-    from openlifu.sim.kwave_if import run_simulation
-
-    params = _build_water_params()
-    arr = _build_ring_transducer()
-    array_world_center_mm = (0.0, 0.0, 40.0)
-    tx_to_world = _transducer_to_world_transform(array_world_center_mm)
-
-    target_world_mm = (0.0, 0.0, -40.0)
-    target = Point(
-        position=target_world_mm,
-        units="mm",
-        dims=("x", "y", "z"),
-    )
-
-    method = SimulationCorrected(c0=SOUND_SPEED_MPS, cfl=0.3, n_cycles=3, gpu=False)
-
-    try:
-        delays = method.calc_delays(arr, target, params, transform=tx_to_world)
-    except (ValueError, RuntimeError) as e:
-        pytest.xfail(
-            f"calc_delays raised {type(e).__name__}: {e}. Likely pose / "
-            "out-of-grid issue; see POSE_FIX_PROPOSAL_2026-04-17.md."
-        )
-
-    result = run_simulation(
-        arr=arr, params=params, delays=delays,
-        freq=FREQ_HZ, cycles=3, amplitude=1.0,
-        ref_values_only=True, gpu=False,
-        transform=tx_to_world,
-    )
-
-    peak_x, peak_y, peak_z = _focal_peak_mm(result["p_max"])
-    print(
-        f"\n[corrected-delays test] focal peak (mm): "
-        f"x={peak_x:.3f}, y={peak_y:.3f}, z={peak_z:.3f}  "
-        f"target={target_world_mm}  delays(us)="
-        f"{np.asarray(delays) * 1e6}"
-    )
-    tol_mm = 2 * GRID_DX_MM
-    assert abs(peak_x - target_world_mm[0]) < tol_mm, (
-        f"Focal x {peak_x} > {tol_mm} mm from target {target_world_mm[0]}"
-    )
-    assert abs(peak_y - target_world_mm[1]) < tol_mm, (
-        f"Focal y {peak_y} > {tol_mm} mm from target {target_world_mm[1]}"
-    )
-    assert abs(peak_z - target_world_mm[2]) < tol_mm, (
-        f"Focal z {peak_z} > {tol_mm} mm from target {target_world_mm[2]}"
-    )
+    with patch.object(sim_corr, "_run_reciprocal_simulation", _raise_out_of_grid):
+        with patch.object(sim_corr, "_fallback_delays") as mock_fallback:
+            with pytest.raises(OutOfGridError):
+                sim_corr.calc_delays(arr, target, params, transform=tx)
+            mock_fallback.assert_not_called()

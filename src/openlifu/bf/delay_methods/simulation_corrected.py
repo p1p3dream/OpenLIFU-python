@@ -17,6 +17,15 @@ from openlifu.xdc import Transducer
 logger = logging.getLogger(__name__)
 
 
+class OutOfGridError(Exception):
+    """Raised when transducer elements fall outside the simulation grid.
+
+    Deliberately does NOT inherit from ValueError so that the calc_delays
+    fallback handler (which catches ValueError for generic k-Wave failures)
+    cannot silently swallow a pose/transform configuration error.
+    """
+
+
 @dataclass
 class SimulationCorrected(DelayMethod):
     """Delay method using k-wave simulation with reciprocity for phase correction.
@@ -53,6 +62,14 @@ class SimulationCorrected(DelayMethod):
     transform misconfiguration is caught instead of silently producing a large
     focal error."""
 
+    collect_diagnostics: Annotated[
+        bool,
+        OpenLIFUFieldData("Collect Diagnostics", "When True, populate self._diagnostics with per-element Hilbert envelope data after running the reciprocal simulation."),
+    ] = False
+    """When True, the reciprocal simulation stores detailed per-element
+    diagnostic data (envelope peaks, gate bounds, arrival times) in
+    self._diagnostics for offline validation of the gate margin."""
+
     def __post_init__(self):
         if not isinstance(self.c0, int | float):
             raise TypeError("Speed of sound must be a number")
@@ -79,6 +96,9 @@ class SimulationCorrected(DelayMethod):
 
         if not isinstance(self.allow_out_of_grid_fallback, bool):
             raise TypeError("allow_out_of_grid_fallback must be a boolean")
+
+        if not isinstance(self.collect_diagnostics, bool):
+            raise TypeError("collect_diagnostics must be a boolean")
 
     def calc_delays(self, arr: Transducer, target: Point, params: xa.Dataset, transform: np.ndarray | None = None):
         """Calculate delays using k-wave simulation with reciprocity.
@@ -204,7 +224,7 @@ class SimulationCorrected(DelayMethod):
                 out_of_grid.add(el_i)
                 if not self.allow_out_of_grid_fallback:
                     dim_name, cmin, cmax = bad_axis
-                    raise ValueError(
+                    raise OutOfGridError(
                         f"Element {el_i} at position {epos_xyz} is outside the simulation grid "
                         f"with coord bounds along {dim_name}=[{cmin}, {cmax}]. "
                         "This usually means the transducer pose transform is missing or wrong. "
@@ -307,6 +327,9 @@ class SimulationCorrected(DelayMethod):
         n_elements = len(arr.elements)
         arrival_times = np.zeros(n_elements)
 
+        self._diagnostics = None
+        element_diagnostics = [] if self.collect_diagnostics else None
+
         for el_i, sensor_idx in enumerate(sensor_indices):
             if el_i in out_of_grid:
                 # Element is outside the simulation grid; use geometric fallback.
@@ -315,6 +338,20 @@ class SimulationCorrected(DelayMethod):
                 )
                 dist_m = dist_grid * getunitconversion(coord_units, 'm')
                 arrival_times[el_i] = dist_m / sound_speed_ref
+                if element_diagnostics is not None:
+                    element_diagnostics.append({
+                        'index': el_i,
+                        'distance_mm': float(dist_grid),
+                        'geometric_tof_s': float(dist_m / sound_speed_ref),
+                        'earliest_arrival_s': float(dist_m / sound_speed_max),
+                        'gate_start_sample': 0,
+                        'peak_sample': 0,
+                        'arrival_time_s': float(arrival_times[el_i]),
+                        'peak_amplitude': 0.0,
+                        'envelope_max_ungated': 0.0,
+                        'ungated_peak_sample': 0,
+                        'out_of_grid': True,
+                    })
                 continue
 
             # Convert sensor_idx from coord_dims order to xyz order
@@ -328,17 +365,40 @@ class SimulationCorrected(DelayMethod):
             # source voxel. Lower bound: earliest plausible arrival using c_max
             # (bone paths at ~3000 m/s can beat water-speed paths), minus a
             # small 2*dt buffer for numerical dispersion.
-            earliest_arrival_s = (
-                np.linalg.norm(element_positions_raw[el_i] - target_pos_raw)
-                * scl_to_m
-                / sound_speed_max
-            )
+            dist_grid = np.linalg.norm(element_positions_raw[el_i] - target_pos_raw)
+            dist_m = dist_grid * scl_to_m
+            earliest_arrival_s = dist_m / sound_speed_max
             gate_start = max(0, int((earliest_arrival_s - 2 * dt) / dt))
             if gate_start >= len(envelope):
                 gate_start = 0  # fallback, should not happen given t_end margin
             # The arrival time is the time of the envelope peak after the gate
             peak_sample = gate_start + int(np.argmax(envelope[gate_start:]))
             arrival_times[el_i] = peak_sample * dt
+
+            if element_diagnostics is not None:
+                element_diagnostics.append({
+                    'index': el_i,
+                    'distance_mm': float(dist_grid),
+                    'geometric_tof_s': float(dist_m / sound_speed_ref),
+                    'earliest_arrival_s': float(earliest_arrival_s),
+                    'gate_start_sample': gate_start,
+                    'peak_sample': peak_sample,
+                    'arrival_time_s': float(arrival_times[el_i]),
+                    'peak_amplitude': float(envelope[peak_sample - gate_start] if peak_sample >= gate_start else 0),
+                    'envelope_max_ungated': float(np.max(envelope)),
+                    'ungated_peak_sample': int(np.argmax(envelope)),
+                    'out_of_grid': False,
+                })
+
+        if self.collect_diagnostics:
+            self._diagnostics = {
+                'dt': dt,
+                'n_timesteps': sensor_data.shape[0],
+                'freq': freq,
+                'sound_speed_ref': sound_speed_ref,
+                'sound_speed_max': sound_speed_max,
+                'elements': element_diagnostics,
+            }
 
         return arrival_times
 

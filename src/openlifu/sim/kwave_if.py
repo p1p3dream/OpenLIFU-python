@@ -53,10 +53,19 @@ def get_karray(arr: xdc.Transducer,
     # position to meters then left-multiplies matrix, so no further scaling is
     # needed at this call site.
     matrix = np.asarray(transform, dtype=float) if transform is not None else np.eye(4)
+    R_transform = matrix[:3, :3]
     for el in arr.elements:
         ele_pos = list(el.get_position(units="m", matrix=matrix))
         ele_w, ele_l = el.get_size(units="m")
-        ele_angle = list(el.get_angle(units="deg"))
+        # Compose element local rotation with the external transform rotation.
+        # Element.get_matrix()[:3,:3] is Ry(az) @ Rx(el) @ Rz(roll).
+        R_local = el.get_matrix()[:3, :3]
+        R_world = R_transform @ R_local
+        # Decompose back to (el, az, roll) in the same YXZ convention.
+        el_rad = -np.arcsin(np.clip(R_world[1, 2], -1.0, 1.0))
+        az_rad = np.arctan2(R_world[0, 2], R_world[2, 2])
+        roll_rad = np.arctan2(R_world[1, 0], R_world[1, 1])
+        ele_angle = [np.degrees(el_rad), np.degrees(az_rad), np.degrees(roll_rad)]
         karray.add_rect_element(ele_pos, ele_w, ele_l, ele_angle)
     translation = kwave.data.Vector(translation)
     rotation = kwave.data.Vector(rotation)
