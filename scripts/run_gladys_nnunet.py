@@ -106,7 +106,7 @@ CYCLES = 5
 AMPLITUDE = 1.0
 C0 = 1500.0
 T_END_SAFETY = 2.0
-GRID_MARGIN_MM = 10.0
+GRID_MARGIN_MM = 25.0
 
 # Enable the lightweight time-gated probe after each full run_simulation call.
 # Set the env var OPENLIFU_DISABLE_TIMEGATED_PROBE=1 to turn it off at runtime

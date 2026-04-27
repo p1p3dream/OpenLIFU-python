@@ -97,7 +97,7 @@ GRID_SPACING_MM = 0.5
 RECIPROCAL_CFL = 0.3
 RECIPROCAL_N_CYCLES = 3
 C0 = 1500.0
-GRID_MARGIN_MM = 10.0
+GRID_MARGIN_MM = 25.0
 
 # Ray-march step for skull traversal (the SDF-based entry point is sub-voxel
 # via linear interpolation, so this mostly affects path-length accumulation).

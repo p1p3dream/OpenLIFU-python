@@ -70,6 +70,24 @@ class SimulationCorrected(DelayMethod):
     diagnostic data (envelope peaks, gate bounds, arrival times) in
     self._diagnostics for offline validation of the gate margin."""
 
+    peak_method: Annotated[
+        str,
+        OpenLIFUFieldData("Peak Method", "Method for picking the arrival-time peak from the Hilbert envelope. 'first_arrival' finds the first significant peak (robust to late reverberations in skull); 'argmax' picks the global maximum (legacy behavior)."),
+    ] = "first_arrival"
+    """Method for picking the arrival-time peak from the Hilbert envelope.
+    'first_arrival' uses threshold-based first-arrival detection (robust to
+    late reverberations/mode conversions in skull at 500 kHz). 'argmax' picks
+    the global maximum (legacy behavior, suitable for homogeneous media)."""
+
+    first_arrival_threshold: Annotated[
+        float,
+        OpenLIFUFieldData("First Arrival Threshold", "Fraction of the max envelope amplitude used to detect the first arrival. Only used when peak_method='first_arrival'. Lower values detect weaker direct arrivals but are more sensitive to noise."),
+    ] = 0.1
+    """Fraction of the max gated envelope amplitude used as the threshold for
+    first-arrival detection. The first sample exceeding this fraction is taken
+    as the approximate arrival; a local-peak refinement then finds the nearest
+    envelope peak. Default 0.1 (10% of max)."""
+
     def __post_init__(self):
         if not isinstance(self.c0, int | float):
             raise TypeError("Speed of sound must be a number")
@@ -99,6 +117,17 @@ class SimulationCorrected(DelayMethod):
 
         if not isinstance(self.collect_diagnostics, bool):
             raise TypeError("collect_diagnostics must be a boolean")
+
+        if not isinstance(self.peak_method, str):
+            raise TypeError("peak_method must be a string")
+        if self.peak_method not in ("first_arrival", "argmax"):
+            raise ValueError("peak_method must be 'first_arrival' or 'argmax'")
+
+        if not isinstance(self.first_arrival_threshold, int | float):
+            raise TypeError("first_arrival_threshold must be a number")
+        if self.first_arrival_threshold <= 0 or self.first_arrival_threshold >= 1:
+            raise ValueError("first_arrival_threshold must be between 0 and 1 (exclusive)")
+        self.first_arrival_threshold = float(self.first_arrival_threshold)
 
     def calc_delays(self, arr: Transducer, target: Point, params: xa.Dataset, transform: np.ndarray | None = None):
         """Calculate delays using k-wave simulation with reciprocity.
@@ -371,8 +400,37 @@ class SimulationCorrected(DelayMethod):
             gate_start = max(0, int((earliest_arrival_s - 2 * dt) / dt))
             if gate_start >= len(envelope):
                 gate_start = 0  # fallback, should not happen given t_end margin
-            # The arrival time is the time of the envelope peak after the gate
-            peak_sample = gate_start + int(np.argmax(envelope[gate_start:]))
+
+            # Pick the arrival-time sample from the gated envelope.
+            gated_env = envelope[gate_start:]
+            if self.peak_method == "first_arrival":
+                # First-arrival detection: find the first significant peak,
+                # which is the direct wavefront through skull. Late
+                # reverberations / mode conversions can be larger in
+                # amplitude but arrive later and should be ignored.
+                max_env = np.max(gated_env)
+                if max_env == 0:
+                    peak_sample = gate_start
+                else:
+                    threshold = self.first_arrival_threshold * max_env
+                    above = np.where(gated_env >= threshold)[0]
+                    if len(above) == 0:
+                        # Should not happen since threshold < max, but guard
+                        first_above = 0
+                    else:
+                        first_above = int(above[0])
+                    # Refine: find the local peak nearest to (and around) the
+                    # threshold crossing. Search a small window of +/- 5
+                    # samples centered on the crossing point.
+                    win_half = 5
+                    win_start = max(0, first_above - win_half)
+                    win_end = min(len(gated_env), first_above + win_half + 1)
+                    local_peak = win_start + int(np.argmax(gated_env[win_start:win_end]))
+                    peak_sample = gate_start + local_peak
+            else:
+                # Legacy argmax: pick the global maximum in the gated region.
+                peak_sample = gate_start + int(np.argmax(gated_env))
+
             arrival_times[el_i] = peak_sample * dt
 
             if element_diagnostics is not None:
@@ -384,7 +442,7 @@ class SimulationCorrected(DelayMethod):
                     'gate_start_sample': gate_start,
                     'peak_sample': peak_sample,
                     'arrival_time_s': float(arrival_times[el_i]),
-                    'peak_amplitude': float(envelope[peak_sample - gate_start] if peak_sample >= gate_start else 0),
+                    'peak_amplitude': float(envelope[peak_sample]),
                     'envelope_max_ungated': float(np.max(envelope)),
                     'ungated_peak_sample': int(np.argmax(envelope)),
                     'out_of_grid': False,
@@ -397,6 +455,8 @@ class SimulationCorrected(DelayMethod):
                 'freq': freq,
                 'sound_speed_ref': sound_speed_ref,
                 'sound_speed_max': sound_speed_max,
+                'peak_method': self.peak_method,
+                'first_arrival_threshold': self.first_arrival_threshold,
                 'elements': element_diagnostics,
             }
 
@@ -421,5 +481,7 @@ class SimulationCorrected(DelayMethod):
             {"Name": "Source Cycles", "Value": self.n_cycles, "Unit": ""},
             {"Name": "Use GPU", "Value": self.gpu, "Unit": ""},
             {"Name": "Allow Out-of-Grid Fallback", "Value": self.allow_out_of_grid_fallback, "Unit": ""},
+            {"Name": "Peak Method", "Value": self.peak_method, "Unit": ""},
+            {"Name": "First Arrival Threshold", "Value": self.first_arrival_threshold, "Unit": ""},
         ]
         return pd.DataFrame.from_records(records)

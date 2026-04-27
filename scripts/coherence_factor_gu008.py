@@ -102,7 +102,7 @@ CFL = 0.1                      # forward-sim CFL used in run_gladys_nnunet.py
 RECIPROCAL_CFL = 0.3           # SimulationCorrected default
 RECIPROCAL_N_CYCLES = 3        # SimulationCorrected default
 C0 = 1500.0
-GRID_MARGIN_MM = 10.0
+GRID_MARGIN_MM = 25.0
 
 
 def main() -> int:

@@ -71,7 +71,7 @@ FREQ_HZ = 500e3
 ELEMENT_SIZE_MM = 5.0
 GRID_SPACING_MM = 0.5
 C0 = 1500.0
-GRID_MARGIN_MM = 10.0
+GRID_MARGIN_MM = 25.0
 
 DATA_ROOT = Path.home() / "Data/openlifu-validation"
 MRI_DIR = DATA_ROOT / "datasets/birnbaum-fullhead/Data/Anonymized_Subjects/T1-Weighted MRI"

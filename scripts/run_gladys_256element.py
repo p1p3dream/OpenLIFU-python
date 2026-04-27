@@ -1,27 +1,15 @@
 #!/usr/bin/env python3
-"""Parameterized GLADYS-nnU-Net sim for Birnbaum full-head subjects.
+"""Parameterized GLADYS sim for 256-element hemispherical array.
 
-Forked from run_gladys_nnunet.py (which was hardcoded to GU008). Adds:
-  - --subject <SubjectID> flag to derive MRI + label paths
-  - Inline focal-gain metric (p@target vs aperture-band mean) at 10 mm radius
-  - Time-gated probe (sparse sensor) with BOTH a geometric-gate and a
-    water-calibrated-gate p_focal_window@target. The water-calibrated gate
-    uses the peak time of the target sensor in the homogeneous-water sim as
-    the gate center for the corresponding skull sims' target sensor.
-  - OUTPUT_TAG env var to prefix output filenames (so batch reruns don't
-    clobber prior results).
-  - Runs SIM C (water) FIRST so its target-peak time is available for the
-    skull sim probes.
-  - A final one-line machine-parseable summary:
-      SUBJECT_SUMMARY subject=<ID> bone_pct=<X> skull_path_near=<Y>
-      p_water=<Z> p_skull=<W> p_geom_skull=<V>
-      gain_vs_mean_water=<G> gain_vs_mean_skull=<H> atten_db=<A>
-      p_fw_geom_water=<> p_fw_geom_skull_corr=<> p_fw_geom_skull_geom=<>
-      p_fw_water_skull_corr=<> p_fw_water_skull_geom=<>
-      t_water_peak_us=<> tof_geom_us=<>
-      atten_db_fw_geom=<> atten_db_fw_water=<>
+Forked from run_gladys_nnunet_subject.py with these differences:
+  - 256 elements (vs 64), radius 100 mm (vs 90), aperture 110 mm (vs 80)
+  - Uses ComplexWeighted delay method by default (env DELAY_METHOD overrides)
+  - Uses sum normalization by default (env CW_NORM overrides)
+  - CLI flags --n-elements, --radius-mm, --aperture-mm override array constants
 
-This script is intentionally NOT committed; it's a local batch-driver tool.
+Otherwise identical: PreSegmented class, load_nifti_as_xarray, focal stats,
+probe/shell logic, time-gated probe, water-calibrated gate, _gpu_flock import,
+sim pipeline (water/corrected/geometric), summary output line.
 """
 from __future__ import annotations
 
@@ -109,9 +97,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-N_ELEMENTS = 64
-RADIUS_MM = 90.0
-APERTURE_MM = 80.0
+N_ELEMENTS = 256
+RADIUS_MM = 100.0
+APERTURE_MM = 110.0
 FREQ_HZ = 500e3
 ELEMENT_SIZE_MM = 5.0
 GRID_SPACING_MM = 0.5
@@ -148,17 +136,16 @@ SIDECAR_MAX_VOXELS: int | None = int(_sidecar_cap_raw) if _sidecar_cap_raw else 
 _stride_raw = os.environ.get("CUBE_PROBE_STRIDE", "1").strip()
 CUBE_PROBE_STRIDE: int = max(1, int(_stride_raw)) if _stride_raw else 1
 
-# Delay method selector. Mirrors run_gladys_nnunet.py. "simulation_corrected"
-# (default) preserves previous behavior. "complex_weighted" swaps in
-# ComplexWeighted (narrowband complex weights) which returns (delays, apod)
+# Delay method selector. "complex_weighted" (default for 256-element array)
+# uses ComplexWeighted (narrowband complex weights) which returns (delays, apod)
 # via calc_delays_and_apod; the returned apod is multiplied into the
-# (uniform) apod base.
-DELAY_METHOD = os.environ.get("DELAY_METHOD", "simulation_corrected").strip().lower()
+# (uniform) apod base. "simulation_corrected" preserves the original behavior.
+DELAY_METHOD = os.environ.get("DELAY_METHOD", "complex_weighted").strip().lower()
 if DELAY_METHOD not in ("simulation_corrected", "complex_weighted"):
     raise ValueError(
         f"DELAY_METHOD must be 'simulation_corrected' or 'complex_weighted', got '{DELAY_METHOD}'"
     )
-CW_NORM = os.environ.get("CW_NORM", "max").strip().lower()
+CW_NORM = os.environ.get("CW_NORM", "sum").strip().lower()
 if CW_NORM not in ("max", "sum", "rms"):
     raise ValueError(f"CW_NORM must be max/sum/rms, got '{CW_NORM}'")
 
@@ -264,7 +251,7 @@ class PreSegmented(SegmentationMethod):
 
 
 def create_hemispherical_array(
-    n_elements=64, radius_mm=90.0, aperture_mm=80.0,
+    n_elements=256, radius_mm=100.0, aperture_mm=110.0,
     freq_hz=500e3, element_size_mm=5.0,
 ) -> Transducer:
     half_aperture = aperture_mm / 2.0
@@ -289,7 +276,7 @@ def create_hemispherical_array(
             units="mm",
         ))
     return Transducer(
-        id="hemi64", name=f"Hemispherical {n_elements}-element array",
+        id=f"hemi{n_elements}", name=f"Hemispherical {n_elements}-element array",
         elements=elements, frequency=freq_hz, units="mm",
     )
 
@@ -875,18 +862,13 @@ def main():
                     help="Results dir (default: ~/Data/openlifu-validation/results)")
     ap.add_argument("--output-tag", default=None,
                     help="Prefix tag for output filenames (overrides OUTPUT_TAG env var)")
-    ap.add_argument("--orient-theta", type=float, default=None,
-                    help="Polar angle (degrees) of array approach direction. "
-                         "theta=0 is +z (superior), theta=90 is in the xy-plane. "
-                         "Must be used together with --orient-phi.")
-    ap.add_argument("--orient-phi", type=float, default=None,
-                    help="Azimuthal angle (degrees) of array approach direction. "
-                         "phi=0 is +x, phi=90 is +y. Direction is from brain center "
-                         "to array aperture center. Must be used together with --orient-theta.")
+    ap.add_argument("--n-elements", type=int, default=N_ELEMENTS,
+                    help=f"Number of transducer elements (default: {N_ELEMENTS})")
+    ap.add_argument("--radius-mm", type=float, default=RADIUS_MM,
+                    help=f"Hemispherical array radius in mm (default: {RADIUS_MM})")
+    ap.add_argument("--aperture-mm", type=float, default=APERTURE_MM,
+                    help=f"Hemispherical array aperture in mm (default: {APERTURE_MM})")
     args = ap.parse_args()
-
-    if (args.orient_theta is None) != (args.orient_phi is None):
-        ap.error("--orient-theta and --orient-phi must be provided together.")
 
     subj = args.subject
     mri_path = Path(args.mri_path) if args.mri_path else (
@@ -905,9 +887,10 @@ def main():
 
     t_total = time.time()
     print("=" * 72)
-    print(f"GLADYS nnU-Net sim | subject={subj} | output_tag='{output_tag}'")
+    print(f"GLADYS 256-element sim | subject={subj} | output_tag='{output_tag}'")
     print(f"  MRI:    {mri_path}")
     print(f"  Labels: {label_path}")
+    print(f"  Array:  n_elements={args.n_elements}, radius={args.radius_mm} mm, aperture={args.aperture_mm} mm")
     print("=" * 72)
     if not mri_path.exists():
         print(f"ERROR: MRI not found: {mri_path}")
@@ -960,52 +943,31 @@ def main():
     max_skull_per_axis = np.array([
         float(skull_mm[ax].max() - target_mm[ax]) for ax in range(3)
     ])
-
-    if args.orient_theta is not None and args.orient_phi is not None:
-        # Manual override: build approach direction from spherical angles
-        theta_rad = np.radians(args.orient_theta)
-        phi_rad = np.radians(args.orient_phi)
-        approach_dir = np.array([
-            np.sin(theta_rad) * np.cos(phi_rad),
-            np.sin(theta_rad) * np.sin(phi_rad),
-            np.cos(theta_rad),
-        ])
-        orient_label = (
-            f"theta={args.orient_theta:.1f} deg, phi={args.orient_phi:.1f} deg "
-            f"(manual override)"
-        )
-    else:
-        # Auto-detect: axis with maximum skull extent
-        approach_axis = int(np.argmax(max_skull_per_axis))
-        approach_dir = np.zeros(3)
-        approach_dir[approach_axis] = 1.0
-        # Compute equivalent spherical angles for logging
-        auto_theta = np.degrees(np.arccos(np.clip(approach_dir[2], -1, 1)))
-        auto_phi = np.degrees(np.arctan2(approach_dir[1], approach_dir[0]))
-        orient_label = (
-            f"theta={auto_theta:.1f} deg, phi={auto_phi:.1f} deg "
-            f"(auto-detected axis {dim_names[approach_axis]})"
-        )
-
-    print(f"Array orientation: {orient_label}")
+    approach_axis = int(np.argmax(max_skull_per_axis))
+    print(f"Approach axis: {dim_names[approach_axis]} (axis {approach_axis})")
 
     # Array
     arr_local = create_hemispherical_array(
-        n_elements=N_ELEMENTS, radius_mm=RADIUS_MM, aperture_mm=APERTURE_MM,
+        n_elements=args.n_elements, radius_mm=args.radius_mm,
+        aperture_mm=args.aperture_mm,
         freq_hz=FREQ_HZ, element_size_mm=ELEMENT_SIZE_MM,
     )
-
-    # Build rotation from local z-axis to approach_dir
-    z_axis = np.array([0.0, 0.0, 1.0])
-    v = np.cross(z_axis, approach_dir)
-    c = np.dot(z_axis, approach_dir)
-    if np.linalg.norm(v) < 1e-10:
-        R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
-    else:
-        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-        R = np.eye(3) + vx + vx @ vx / (1 + c)
     transform = np.eye(4)
-    transform[:3, :3] = R
+    transform[:3, 3] = target_mm
+    if approach_axis == 0:
+        angle = np.pi / 2
+        transform[:3, :3] = np.array([
+            [np.cos(angle), 0, np.sin(angle)],
+            [0, 1, 0],
+            [-np.sin(angle), 0, np.cos(angle)],
+        ])
+    elif approach_axis == 1:
+        angle = -np.pi / 2
+        transform[:3, :3] = np.array([
+            [1, 0, 0],
+            [0, np.cos(angle), -np.sin(angle)],
+            [0, np.sin(angle), np.cos(angle)],
+        ])
     transform[:3, 3] = target_mm
     arr = deepcopy(arr_local)
     for el in arr.elements:

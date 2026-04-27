@@ -128,13 +128,17 @@ class TestSimulationCorrectedTable:
     def test_to_table(self):
         method = SimulationCorrected()
         table = method.to_table()
-        assert len(table) == 6
+        assert len(table) == 8
         assert table.iloc[0]['Name'] == 'Type'
         assert table.iloc[0]['Value'] == 'SimulationCorrected'
         assert table.iloc[1]['Name'] == 'Default Sound Speed'
         assert table.iloc[1]['Value'] == 1500.0
         assert table.iloc[5]['Name'] == 'Allow Out-of-Grid Fallback'
         assert table.iloc[5]['Value'] is False
+        assert table.iloc[6]['Name'] == 'Peak Method'
+        assert table.iloc[6]['Value'] == 'first_arrival'
+        assert table.iloc[7]['Name'] == 'First Arrival Threshold'
+        assert table.iloc[7]['Value'] == 0.1
 
 
 class TestSimulationCorrectedBehavior:
@@ -236,8 +240,9 @@ class TestSimulationCorrectedOutOfGrid:
         return xdc.Transducer(elements=elements, frequency=500_000, units="mm")
 
     def test_raises_on_out_of_grid_by_default(self):
-        """Default allow_out_of_grid_fallback=False should raise ValueError
+        """Default allow_out_of_grid_fallback=False should raise OutOfGridError
         when an element lands outside the params grid."""
+        from openlifu.bf.delay_methods.simulation_corrected import OutOfGridError
         from openlifu.geo import Point
 
         method = SimulationCorrected(gpu=False)
@@ -247,7 +252,7 @@ class TestSimulationCorrectedOutOfGrid:
         arr = self._build_far_transducer()
         target = Point(position=(0.0, 0.0, 0.0), units="mm", dims=("x", "y", "z"))
 
-        with pytest.raises(ValueError, match="outside the simulation grid"):
+        with pytest.raises(OutOfGridError, match="outside the simulation grid"):
             method._run_reciprocal_simulation(
                 arr=arr, target=target, params=params, transform=None,
             )
@@ -255,6 +260,7 @@ class TestSimulationCorrectedOutOfGrid:
     def test_out_of_grid_error_mentions_transform_hint(self):
         """The error message should mention allow_out_of_grid_fallback so the
         user knows how to opt out if they really want the old behavior."""
+        from openlifu.bf.delay_methods.simulation_corrected import OutOfGridError
         from openlifu.geo import Point
 
         method = SimulationCorrected(gpu=False)
@@ -262,14 +268,16 @@ class TestSimulationCorrectedOutOfGrid:
         arr = self._build_far_transducer()
         target = Point(position=(0.0, 0.0, 0.0), units="mm", dims=("x", "y", "z"))
 
-        with pytest.raises(ValueError, match="allow_out_of_grid_fallback"):
+        with pytest.raises(OutOfGridError, match="allow_out_of_grid_fallback"):
             method._run_reciprocal_simulation(
                 arr=arr, target=target, params=params, transform=None,
             )
 
-    def test_calc_delays_uses_fallback_when_raise_triggers(self):
-        """calc_delays catches the ValueError and returns Direct fallback
-        delays, so end-user behavior stays sane even though the raise fires."""
+    def test_calc_delays_propagates_out_of_grid_error(self):
+        """calc_delays does NOT catch OutOfGridError (it only catches
+        RuntimeError/ValueError/IndexError/OSError). OutOfGridError must
+        propagate so that callers know the transform is misconfigured."""
+        from openlifu.bf.delay_methods.simulation_corrected import OutOfGridError
         from openlifu.geo import Point
 
         method = SimulationCorrected(gpu=False)
@@ -282,10 +290,10 @@ class TestSimulationCorrectedOutOfGrid:
             "_fallback_delays",
             return_value=np.array([0.0]),
         ) as mock_fallback:
-            delays = method.calc_delays(arr=arr, target=target, params=params)
+            with pytest.raises(OutOfGridError):
+                method.calc_delays(arr=arr, target=target, params=params)
 
-        mock_fallback.assert_called_once()
-        np.testing.assert_array_equal(delays, [0.0])
+        mock_fallback.assert_not_called()
 
     def test_invalid_allow_out_of_grid_fallback_type(self):
         with pytest.raises(TypeError, match="allow_out_of_grid_fallback"):

@@ -74,7 +74,7 @@ C0 = 1500.0             # reference sound speed (water, m/s)
 T_END_SAFETY = 2.0      # safety factor for t_end calculation
 
 # Grid margin around transducer and target
-GRID_MARGIN_MM = 10.0
+GRID_MARGIN_MM = 25.0
 
 
 # ---------------------------------------------------------------------------
