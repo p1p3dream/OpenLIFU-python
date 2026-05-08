@@ -88,9 +88,9 @@ from openlifu.bf.delay_methods.complex_weighted import ComplexWeighted
 from openlifu.bf.delay_methods.direct import Direct
 from openlifu.bf.delay_methods.simulation_corrected import SimulationCorrected
 from openlifu.geo import Point
-from openlifu.seg.material import MATERIALS, Material
+from openlifu.seg.material import MATERIALS, MATERIALS_TWO_CLASS_BONE, Material
 from openlifu.seg.seg_method import SegmentationMethod
-from openlifu.seg.seg_methods.nnunet_seg import LABEL_MAP_FULLHEAD
+from openlifu.seg.seg_methods.nnunet_seg import LABEL_MAP_FULLHEAD, LABEL_MAP_FULLHEAD_TWO_CLASS_BONE
 from openlifu.seg.seg_methods.threshold_mri import CSF, GRAY_MATTER, WHITE_MATTER
 from openlifu.sim.kwave_if import (
     get_kgrid,
@@ -188,6 +188,14 @@ else:
 
 def _default_fullhead_materials() -> dict[str, Material]:
     m = MATERIALS.copy()
+    m["csf"] = CSF
+    m["gray_matter"] = GRAY_MATTER
+    m["white_matter"] = WHITE_MATTER
+    return m
+
+
+def _default_fullhead_materials_two_class_bone() -> dict[str, Material]:
+    m = MATERIALS_TWO_CLASS_BONE.copy()
     m["csf"] = CSF
     m["gray_matter"] = GRAY_MATTER
     m["white_matter"] = WHITE_MATTER
@@ -883,6 +891,10 @@ def main():
                     help="Azimuthal angle (degrees) of array approach direction. "
                          "phi=0 is +x, phi=90 is +y. Direction is from brain center "
                          "to array aperture center. Must be used together with --orient-theta.")
+    ap.add_argument("--bone-model", choices=["single", "two_class"], default="single",
+                    help="Bone material model: 'single' (homogeneous skull) or "
+                         "'two_class' (cortical + trabecular). Two-class requires "
+                         "label NIfTIs with label 5=cortical, 7=trabecular.")
     args = ap.parse_args()
 
     if (args.orient_theta is None) != (args.orient_phi is None):
@@ -917,8 +929,17 @@ def main():
         sys.exit(1)
 
     volume = load_nifti_as_xarray(mri_path)
-    seg_method = PreSegmented(label_nifti_path=str(label_path))
+    if args.bone_model == "two_class":
+        seg_method = PreSegmented(
+            label_nifti_path=str(label_path),
+            nnunet_label_map=dict(LABEL_MAP_FULLHEAD_TWO_CLASS_BONE),
+            materials=_default_fullhead_materials_two_class_bone(),
+        )
+    else:
+        seg_method = PreSegmented(label_nifti_path=str(label_path))
+    bone_model = args.bone_model
     print(f"MRI shape: {volume.shape}, label shape: {seg_method._labels.shape}")
+    print(f"Bone model: {bone_model}")
 
     lab_arr = seg_method._labels.to_numpy()
     print("nnU-Net label histogram (raw label file):")
@@ -947,10 +968,16 @@ def main():
     ])
     print(f"Target (brain center): ({target_mm[0]:.1f}, {target_mm[1]:.1f}, {target_mm[2]:.1f}) mm")
 
-    skull_mask = seg_arr == material_idx["skull"]
+    if bone_model == "two_class":
+        skull_mask = (
+            (seg_arr == material_idx["cortical_bone"])
+            | (seg_arr == material_idx["trabecular_bone"])
+        )
+    else:
+        skull_mask = seg_arr == material_idx["skull"]
     skull_indices = np.argwhere(skull_mask)
     if skull_indices.size == 0:
-        print("ERROR: no skull voxels in segmentation; aborting.")
+        print("ERROR: no bone voxels in segmentation; aborting.")
         print(f"SUBJECT_SUMMARY subject={subj} STATUS=no_skull")
         sys.exit(2)
     skull_mm = np.array([
@@ -1054,7 +1081,13 @@ def main():
     sim_seg = seg_method._segment(sim_volume)
     sim_seg_arr = sim_seg.to_numpy()
     air_mask = sim_seg_arr == material_idx["air"]
-    skull_mask_sim = sim_seg_arr == material_idx["skull"]
+    if bone_model == "two_class":
+        skull_mask_sim = (
+            (sim_seg_arr == material_idx["cortical_bone"])
+            | (sim_seg_arr == material_idx["trabecular_bone"])
+        )
+    else:
+        skull_mask_sim = sim_seg_arr == material_idx["skull"]
     water_mat = seg_method.materials["water"]
     n_skull = int(skull_mask_sim.sum())
     total_vox = sim_seg_arr.size
@@ -1078,6 +1111,11 @@ def main():
         sim_origins = np.array([sim_coord_arrays[i][0] for i in range(3)])
         sim_specs = np.array([sim_coord_arrays[i][1] - sim_coord_arrays[i][0] for i in range(3)])
 
+        if bone_model == "two_class":
+            _bone_indices = {material_idx["cortical_bone"], material_idx["trabecular_bone"]}
+        else:
+            _bone_indices = {material_idx["skull"]}
+
         def _skull_path(direction):
             n = int(np.ceil(probe_len_mm / step_mm)) + 1
             ts = np.linspace(0.0, probe_len_mm, n)
@@ -1087,7 +1125,7 @@ def main():
                 sim_seg_arr.astype(np.float32), frac, order=0,
                 mode="constant", cval=-1.0,
             ).astype(np.int16)
-            return int((sampled == material_idx["skull"]).sum()) * step_mm
+            return int(sum(int((sampled == bi).sum()) for bi in _bone_indices)) * step_mm
 
         skull_path_near_mm = _skull_path(ray_unit)
         skull_path_far_mm = _skull_path(-ray_unit)

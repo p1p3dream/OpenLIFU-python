@@ -110,6 +110,27 @@ SKULL = Material(name="skull",
                  specific_heat=1100.0,
                  thermal_conductivity=0.3)
 
+# Two-class bone model: cortical (compact) and trabecular (spongy) bone.
+#
+# Acoustic properties from ITRUSST benchmark (Aubry et al. 2022, JASA):
+#   Cortical bone: c=2800 m/s, rho=1850 kg/m3, alpha=4.0 dB/cm/MHz
+#   Trabecular bone: c=2300 m/s, rho=1700 kg/m3, alpha=8.0 dB/cm/MHz
+#
+# Thermal properties from IT'IS Foundation (cortical/cancellous bone tables).
+CORTICAL_BONE = Material(name="cortical_bone",
+                         sound_speed=2800.0,
+                         density=1850.0,
+                         attenuation=4.0,
+                         specific_heat=1313.0,
+                         thermal_conductivity=0.32)
+
+TRABECULAR_BONE = Material(name="trabecular_bone",
+                           sound_speed=2300.0,
+                           density=1700.0,
+                           attenuation=8.0,
+                           specific_heat=2274.0,
+                           thermal_conductivity=0.31)
+
 AIR = Material(name="air",
                sound_speed=344.0,
                density=1.25,
@@ -129,3 +150,12 @@ MATERIALS = {"water": WATER,
              "skull": SKULL,
              "air": AIR,
              "standoff": STANDOFF}
+
+# Extended material set with two-class bone model.
+# Replaces the single "skull" entry with cortical and trabecular bone.
+MATERIALS_TWO_CLASS_BONE = {"water": WATER,
+                            "tissue": TISSUE,
+                            "cortical_bone": CORTICAL_BONE,
+                            "trabecular_bone": TRABECULAR_BONE,
+                            "air": AIR,
+                            "standoff": STANDOFF}

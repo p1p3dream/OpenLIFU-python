@@ -9,7 +9,7 @@ import pandas as pd
 import xarray as xa
 from scipy.ndimage import zoom as scipy_zoom
 
-from openlifu.seg.material import MATERIALS, Material
+from openlifu.seg.material import CORTICAL_BONE, MATERIALS, MATERIALS_TWO_CLASS_BONE, TRABECULAR_BONE, Material
 from openlifu.seg.seg_method import SegmentationMethod
 from openlifu.seg.seg_methods.threshold_mri import CSF, GRAY_MATTER, WHITE_MATTER
 from openlifu.util.annotations import OpenLIFUFieldData
@@ -38,8 +38,25 @@ LABEL_MAP_SKULL: dict[int, str] = {
     1: "skull",
 }
 
+# Two-class bone label map: splits skull into cortical and trabecular bone.
+# Used when bone_model="two_class" with fullhead segmentation. The nnU-Net
+# fullhead model outputs label 5 as "skull", but when fed pre-segmented
+# volumes (e.g. SimNIBS CHARM output remapped with --two-class-bone),
+# label 5 = cortical_bone and label 7 = trabecular_bone.
+LABEL_MAP_FULLHEAD_TWO_CLASS_BONE: dict[int, str] = {
+    0: "water",
+    1: "air",
+    2: "csf",
+    3: "gray_matter",
+    4: "white_matter",
+    5: "cortical_bone",
+    6: "tissue",
+    7: "trabecular_bone",
+}
+
 # Material key sets for validation (parallel to ThresholdMRI pattern).
 _BASE_MATERIAL_KEYS = frozenset({"water", "skull", "air"})
+_BASE_MATERIAL_KEYS_TWO_CLASS = frozenset({"water", "cortical_bone", "trabecular_bone", "air"})
 _FULLHEAD_EXTRA_KEYS = frozenset({"csf", "gray_matter", "white_matter"})
 _SKULL_EXTRA_KEYS = frozenset({"tissue"})
 
@@ -48,6 +65,20 @@ def _default_materials_fullhead() -> dict[str, Material]:
     """Default materials dict for fullhead mode (adds brain subtypes, keeps tissue for scalp)."""
     m = MATERIALS.copy()
     # Keep "tissue" for label 6 (soft tissue/scalp). Add brain subtypes.
+    m["csf"] = CSF
+    m["gray_matter"] = GRAY_MATTER
+    m["white_matter"] = WHITE_MATTER
+    return m
+
+
+def _default_materials_fullhead_two_class_bone() -> dict[str, Material]:
+    """Default materials dict for fullhead mode with two-class bone model.
+
+    Replaces the single "skull" material with cortical_bone and trabecular_bone,
+    using ITRUSST benchmark acoustic properties. Keeps tissue for scalp and
+    adds brain subtypes.
+    """
+    m = MATERIALS_TWO_CLASS_BONE.copy()
     m["csf"] = CSF
     m["gray_matter"] = GRAY_MATTER
     m["white_matter"] = WHITE_MATTER
@@ -121,12 +152,28 @@ class NNUNetSegmentation(SegmentationMethod):
     ] = True
     """If True, apply test-time augmentation via axis mirroring."""
 
+    bone_model: Annotated[
+        str,
+        OpenLIFUFieldData(
+            "Bone model",
+            'Either "single" for one skull material or "two_class" to split '
+            "skull into cortical bone (outer/inner table) and trabecular bone "
+            "(diploe). Two-class mode uses ITRUSST benchmark properties and "
+            "requires label maps with separate cortical/trabecular labels.",
+        ),
+    ] = "single"
+    """Bone model: 'single' for one skull material, 'two_class' for cortical + trabecular."""
+
     def __post_init__(self) -> None:
         super().__post_init__()
 
         if self.model_type not in PATCH_SIZES:
             valid = ", ".join(sorted(PATCH_SIZES.keys()))
             msg = f"model_type must be one of [{valid}], got '{self.model_type}'."
+            raise ValueError(msg)
+
+        if self.bone_model not in ("single", "two_class"):
+            msg = f"bone_model must be 'single' or 'two_class', got '{self.bone_model}'."
             raise ValueError(msg)
 
         # Auto-add brain tissue materials for fullhead mode.
@@ -139,15 +186,28 @@ class NNUNetSegmentation(SegmentationMethod):
             self.materials.setdefault("gray_matter", GRAY_MATTER)
             self.materials.setdefault("white_matter", WHITE_MATTER)
 
+        # Auto-add two-class bone materials when bone_model="two_class".
+        if self.bone_model == "two_class":
+            self.materials = dict(self.materials)
+            self.materials.setdefault("cortical_bone", CORTICAL_BONE)
+            self.materials.setdefault("trabecular_bone", TRABECULAR_BONE)
+
         # Validate that all required material keys are present.
-        if self.model_type == "fullhead":
-            required = _BASE_MATERIAL_KEYS | _FULLHEAD_EXTRA_KEYS | {"tissue"}
+        if self.bone_model == "two_class":
+            if self.model_type == "fullhead":
+                required = _BASE_MATERIAL_KEYS_TWO_CLASS | _FULLHEAD_EXTRA_KEYS | {"tissue"}
+            else:
+                required = _BASE_MATERIAL_KEYS_TWO_CLASS | _SKULL_EXTRA_KEYS
         else:
-            required = _BASE_MATERIAL_KEYS | _SKULL_EXTRA_KEYS
+            if self.model_type == "fullhead":
+                required = _BASE_MATERIAL_KEYS | _FULLHEAD_EXTRA_KEYS | {"tissue"}
+            else:
+                required = _BASE_MATERIAL_KEYS | _SKULL_EXTRA_KEYS
         missing = required - set(self.materials.keys())
         if missing:
             msg = (
-                f"NNUNetSegmentation (model_type='{self.model_type}') "
+                f"NNUNetSegmentation (model_type='{self.model_type}', "
+                f"bone_model='{self.bone_model}') "
                 f"requires material keys {required}, missing: {missing}."
             )
             raise ValueError(msg)
@@ -488,9 +548,16 @@ class NNUNetSegmentation(SegmentationMethod):
         )
 
         # --- Step 5: Sliding window inference ---
-        label_map = (
-            LABEL_MAP_FULLHEAD if self.model_type == "fullhead" else LABEL_MAP_SKULL
-        )
+        if self.bone_model == "two_class":
+            raise ValueError(
+                "bone_model='two_class' is not supported for live ONNX inference "
+                "because the model outputs 7 classes (single skull). Use "
+                "PreSegmented with pre-split two-class label NIfTIs instead."
+            )
+        if self.model_type == "fullhead":
+            label_map = LABEL_MAP_FULLHEAD
+        else:
+            label_map = LABEL_MAP_SKULL
         num_classes = len(label_map)
 
         aggregated = self._sliding_window_inference(padded, patch_size, num_classes)
@@ -568,6 +635,7 @@ class NNUNetSegmentation(SegmentationMethod):
             {"Name": "Type", "Value": "nnU-Net Segmentation", "Unit": ""},
             {"Name": "Model Path", "Value": self.model_path or "(auto)", "Unit": ""},
             {"Name": "Model Type", "Value": self.model_type, "Unit": ""},
+            {"Name": "Bone Model", "Value": self.bone_model, "Unit": ""},
             {"Name": "Use GPU", "Value": self.use_gpu, "Unit": ""},
             {"Name": "Use Mirroring (TTA)", "Value": self.use_mirroring, "Unit": ""},
             {"Name": "Reference Material", "Value": self.ref_material, "Unit": ""},
