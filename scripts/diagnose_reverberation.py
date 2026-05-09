@@ -184,7 +184,14 @@ def load_nifti_as_xarray(nifti_path: Path) -> xa.DataArray:
 
 
 def main():
-    subj = "GU002"
+    import argparse
+    parser = argparse.ArgumentParser(description="Diagnose reverberation for a given subject")
+    parser.add_argument("--subject", default="GU002", help="Subject ID (default: GU002)")
+    parser.add_argument("--gpu", action="store_true", help="Use GPU for simulation")
+    args = parser.parse_args()
+
+    subj = args.subject
+    use_gpu = args.gpu
     mri_path = Path.home() / "Data/openlifu-validation/datasets/birnbaum-fullhead/Data/Anonymized_Subjects/T1-Weighted MRI" / f"{subj}_deface.nii"
     label_path = Path.home() / "Data/openlifu-validation/results" / f"{subj}_nnunet_labels.nii.gz"
 
@@ -382,7 +389,7 @@ def main():
         n_cycles=N_CYCLES,
         sound_speed_ref=sound_speed_ref,
         cfl=CFL,
-        gpu=True,
+        gpu=use_gpu,
         t_end=t_end_needed,
     )
     t_sim = time.time() - t_start
