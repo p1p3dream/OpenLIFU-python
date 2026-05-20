@@ -309,23 +309,20 @@ def load_nifti_as_xarray(nifti_path: Path) -> xa.DataArray:
     return xa.DataArray(data, dims=dim_names, coords=coords)
 
 
+FOCAL_ROI_RADIUS_MM = 20.0
+
+
 def extract_focal_stats(
     result: xa.Dataset,
     target_mm: np.ndarray,
     label: str,
     element_positions_mm: np.ndarray | None = None,
     exclusion_radius_mm: float = 3.0,
+    roi_radius_mm: float = FOCAL_ROI_RADIUS_MM,
 ) -> dict:
     p_max = result["p_max"].to_numpy()
     dims = list(result["p_max"].dims)
     coord_arrays = {d: result.coords[d].to_numpy() for d in dims}
-
-    raw_idx = np.unravel_index(p_max.argmax(), p_max.shape)
-    raw_focal_mm = np.array([
-        float(coord_arrays[d][raw_idx[i]]) for i, d in enumerate(dims)
-    ])
-    raw_error = float(np.linalg.norm(raw_focal_mm - target_mm))
-    raw_max_p = float(p_max.max())
 
     target_idx = tuple(
         int(np.argmin(np.abs(coord_arrays[dims[ax]] - target_mm[ax])))
@@ -333,49 +330,45 @@ def extract_focal_stats(
     )
     p_at_target = float(p_max[target_idx])
 
-    masked_focal_mm = None
-    masked_error = None
-    masked_max_p = None
-    if element_positions_mm is not None and exclusion_radius_mm > 0:
-        mg = np.meshgrid(*[coord_arrays[d] for d in dims], indexing="ij")
-        coord_stack = np.stack([m for m in mg], axis=-1)
-        mask = np.ones(p_max.shape, dtype=bool)
-        for pos in element_positions_mm:
-            d2 = np.sum((coord_stack - pos) ** 2, axis=-1)
-            mask &= d2 > exclusion_radius_mm ** 2
-        if mask.any():
-            masked_p = np.where(mask, p_max, -np.inf)
-            m_idx = np.unravel_index(masked_p.argmax(), masked_p.shape)
-            masked_focal_mm = np.array([
-                float(coord_arrays[d][m_idx[i]]) for i, d in enumerate(dims)
-            ])
-            masked_error = float(np.linalg.norm(masked_focal_mm - target_mm))
-            masked_max_p = float(p_max[m_idx])
+    mg = np.meshgrid(*[coord_arrays[d] for d in dims], indexing="ij")
+    dist_from_target = np.sqrt(sum((m - t) ** 2 for m, t in zip(mg, target_mm)))
+    roi_mask = dist_from_target <= roi_radius_mm
+
+    pmax_roi = np.where(roi_mask, p_max, -np.inf)
+    roi_idx = np.unravel_index(pmax_roi.argmax(), pmax_roi.shape)
+    focal_mm = np.array([float(coord_arrays[d][roi_idx[i]]) for i, d in enumerate(dims)])
+    focal_error = float(np.linalg.norm(focal_mm - target_mm))
+    p_focal_peak = float(p_max[roi_idx])
+
+    p_max_global = float(p_max.max())
+    global_idx = np.unravel_index(p_max.argmax(), p_max.shape)
+    global_peak_mm = np.array([float(coord_arrays[d][global_idx[i]]) for i, d in enumerate(dims)])
+
+    threshold_6db = p_focal_peak / 2.0
+    focal_region = roi_mask & (p_max >= threshold_6db)
+    spacing_mm = float(np.mean([np.diff(coord_arrays[d]).mean() for d in dims]))
+    focal_vol_mm3 = int(focal_region.sum()) * spacing_mm ** 3
 
     logger.info(
-        "%s: raw max_p=%.4g Pa @ (%s) mm, raw_err=%.2f mm; p@target=%.4g Pa",
-        label, raw_max_p,
-        ", ".join(f"{v:.1f}" for v in raw_focal_mm),
-        raw_error, p_at_target,
+        "%s: focal_peak=%.4g Pa @ (%s) mm, error=%.2f mm; p@target=%.4g Pa (ROI r=%.0f mm)",
+        label, p_focal_peak,
+        ", ".join(f"{v:.1f}" for v in focal_mm),
+        focal_error, p_at_target, roi_radius_mm,
     )
-    if masked_focal_mm is not None:
-        logger.info(
-            "  masked max_p=%.4g Pa @ (%s) mm, masked_err=%.2f mm "
-            "(excl radius %.1f mm around %d sources)",
-            masked_max_p,
-            ", ".join(f"{v:.1f}" for v in masked_focal_mm),
-            masked_error, exclusion_radius_mm, len(element_positions_mm),
-        )
+    logger.info(
+        "  global_max=%.4g Pa @ (%s) mm",
+        p_max_global, ", ".join(f"{v:.1f}" for v in global_peak_mm),
+    )
 
     return {
         "label": label,
-        "max_pressure": raw_max_p,
-        "focal_mm": raw_focal_mm,
-        "focal_error": raw_error,
+        "max_pressure": p_max_global,
+        "p_focal_peak": p_focal_peak,
+        "focal_mm": focal_mm,
+        "focal_error": focal_error,
         "p_at_target": p_at_target,
-        "masked_max_pressure": masked_max_p,
-        "masked_focal_mm": masked_focal_mm,
-        "masked_focal_error": masked_error,
+        "focal_vol_6db_mm3": focal_vol_mm3,
+        "global_peak_mm": global_peak_mm,
     }
 
 
