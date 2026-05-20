@@ -309,7 +309,7 @@ def load_nifti_as_xarray(nifti_path: Path) -> xa.DataArray:
     return xa.DataArray(data, dims=dim_names, coords=coords)
 
 
-FOCAL_ROI_RADIUS_MM = 20.0
+FOCAL_ROI_RADIUS_MM = 40.0
 
 
 def extract_focal_stats(

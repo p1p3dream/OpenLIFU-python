@@ -1142,7 +1142,7 @@ def main():
     print("RESULTS")
     print("=" * 72)
 
-    FOCAL_ROI_RADIUS_MM = 20.0
+    FOCAL_ROI_RADIUS_MM = 40.0
 
     def _focal_stats(result, label):
         pmax = result["p_max"].to_numpy()

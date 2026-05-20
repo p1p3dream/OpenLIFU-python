@@ -306,7 +306,8 @@ def compute_phase_correction(c, rho, alpha_arr, spacing, target_mm, positions_mm
 
 
 def run_jwave_helmholtz_64(c, rho, alpha_arr, spacing, target_mm, positions_mm,
-                            source_weights=None, label="skull"):
+                            source_weights=None, label="skull",
+                            exclusion_radius_mm=5.0):
     """Run j-Wave Helmholtz with 64-element focused array.
 
     source_weights: complex array of per-element weights. If None, all
@@ -337,13 +338,37 @@ def run_jwave_helmholtz_64(c, rho, alpha_arr, spacing, target_mm, positions_mm,
     p_amp = np.abs(p_complex)
 
     p_at_target = float(p_amp[target_idx])
-    p_max = float(p_amp.max())
-    p_max_idx = np.unravel_index(np.argmax(p_amp), p_amp.shape)
+
+    # Unmasked (raw) p_max for reference
+    p_max_raw = float(p_amp.max())
+
+    # Build source exclusion mask: True everywhere except near placed elements.
+    # Near-field singularities at point source voxels dominate the raw global
+    # max, so we exclude a small neighborhood around each element before
+    # finding the meaningful focal maximum.
+    exclusion_radius_voxels = int(np.ceil(exclusion_radius_mm / spacing[0]))
+    source_mask = np.ones(N, dtype=bool)
+    for i in range(N_ELEMENTS):
+        idx = np.rint(positions_mm[i] / np.array(spacing)).astype(int)
+        if all(0 <= idx[d] < N[d] for d in range(3)):
+            slices = tuple(
+                slice(max(0, int(idx[d]) - exclusion_radius_voxels),
+                      min(N[d], int(idx[d]) + exclusion_radius_voxels + 1))
+                for d in range(3)
+            )
+            source_mask[slices] = False
+
+    # Masked p_max (excludes source neighborhoods)
+    p_amp_masked = p_amp.copy()
+    p_amp_masked[~source_mask] = 0.0
+    p_max = float(p_amp_masked.max())
+    p_max_idx = np.unravel_index(np.argmax(p_amp_masked), p_amp_masked.shape)
     p_max_mm = np.array(p_max_idx) * np.array(spacing)
     focal_err = np.linalg.norm(p_max_mm - target_mm)
 
     print(f"    p at target: {p_at_target:.6g} Pa")
-    print(f"    p_max: {p_max:.6g} Pa at idx={p_max_idx} ({p_max_mm} mm)")
+    print(f"    p_max (raw): {p_max_raw:.6g} Pa (includes source near-field)")
+    print(f"    p_max (masked, excl {exclusion_radius_mm}mm): {p_max:.6g} Pa at idx={p_max_idx} ({p_max_mm} mm)")
     print(f"    Focal error: {focal_err:.1f} mm")
 
     return {
@@ -351,6 +376,7 @@ def run_jwave_helmholtz_64(c, rho, alpha_arr, spacing, target_mm, positions_mm,
         "time_s": elapsed,
         "p_at_target": p_at_target,
         "p_max": p_max,
+        "p_max_raw": p_max_raw,
         "focal_err_mm": focal_err,
         "p_field": p_amp,
     }
