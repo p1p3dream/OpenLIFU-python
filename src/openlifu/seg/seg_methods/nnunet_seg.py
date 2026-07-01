@@ -60,6 +60,21 @@ _BASE_MATERIAL_KEYS_TWO_CLASS = frozenset({"water", "cortical_bone", "trabecular
 _FULLHEAD_EXTRA_KEYS = frozenset({"csf", "gray_matter", "white_matter"})
 _SKULL_EXTRA_KEYS = frozenset({"tissue"})
 
+# Canonical material key order for single-bone NNUNetSegmentation. Skull is
+# forced to index 1 so that saved label volumes are interoperable with the
+# project convention (label 1 == skull/bone) used by ThresholdMRI, the N=180
+# validation producer, and the tissue-masking recompute. Without this, NNUNet
+# would emit skull at index 2 because MATERIALS keeps "tissue" before "skull".
+# Only the KEY ORDER is constrained here; the Material definitions are taken
+# verbatim from the caller/default factory. Acoustic-param lookup in
+# SegmentationMethod._map_params uses the same _material_indices(), so this is
+# self-consistent within the OpenLIFU pipeline. Two-class bone mode keeps its
+# own order (cortical/trabecular) and is not used for live ONNX inference.
+_SINGLE_BONE_MATERIAL_ORDER: tuple[str, ...] = (
+    "water", "skull", "air", "standoff", "tissue",
+    "csf", "gray_matter", "white_matter",
+)
+
 
 def _default_materials_fullhead() -> dict[str, Material]:
     """Default materials dict for fullhead mode (adds brain subtypes, keeps tissue for scalp)."""
@@ -110,6 +125,25 @@ class NNUNetSegmentation(SegmentationMethod):
     Each axis of the input volume must have at least 2 coordinate values
     so that voxel spacing can be computed. Coordinate spacing is assumed
     to be uniform along each axis.
+
+    Limitations (status: unverified prototype, GLADYS minimal correctness pass):
+
+    - Preprocessing (resample, foreground crop, z-score, sliding-window blend)
+      is a hand-rolled reimplementation, NOT a bit-faithful copy of nnU-Net v2's
+      ``predict_from_raw_data`` pipeline. It has not been checked against the
+      nnU-Net runtime output. Treat results as unverified until a
+      CT-ground-truth comparison reproduces the N=180 accuracy.
+    - This fullhead ONNX path has not been validated against CT ground truth.
+      (A separate skull-only nnU-Net model, Dataset001, has been CT-validated on
+      held-out SynthRAD with skull Dice 0.903; that is a different code path, not
+      this class.) For transcranial FUS, ThresholdMRI is the validated default
+      (see ``openlifu.gladys.config.default_seg_method``) and remains the
+      upstream-bound path.
+    - Test-time augmentation (``use_mirroring``) is OFF by default to keep CPU
+      inference around 2 min instead of around 13 min. Set ``use_mirroring=True``
+      when accuracy matters more than latency.
+    - Auto-download of the ONNX model is not implemented; supply ``model_path``
+      explicitly.
     """
 
     model_path: Annotated[
@@ -147,10 +181,12 @@ class NNUNetSegmentation(SegmentationMethod):
         OpenLIFUFieldData(
             "Use mirroring (TTA)",
             "If True, apply test-time augmentation by averaging predictions "
-            "across axis-flipped versions of each patch.",
+            "across axis-flipped versions of each patch. TTA multiplies CPU "
+            "inference time by ~8, so it is OFF by default; enable it when "
+            "accuracy matters more than latency.",
         ),
-    ] = True
-    """If True, apply test-time augmentation via axis mirroring."""
+    ] = False
+    """If True, apply test-time augmentation via axis mirroring. Off by default."""
 
     bone_model: Annotated[
         str,
@@ -211,6 +247,21 @@ class NNUNetSegmentation(SegmentationMethod):
                 f"requires material keys {required}, missing: {missing}."
             )
             raise ValueError(msg)
+
+        # Force the canonical single-bone material index order so the skull
+        # label matches the project convention (label 1 == skull). See
+        # _SINGLE_BONE_MATERIAL_ORDER. Only key order changes; Material values
+        # are preserved. Two-class bone keeps its own order.
+        if self.bone_model == "single":
+            ordered = {
+                key: self.materials[key]
+                for key in _SINGLE_BONE_MATERIAL_ORDER
+                if key in self.materials
+            }
+            for key, value in self.materials.items():
+                if key not in ordered:
+                    ordered[key] = value
+            self.materials = ordered
 
         # The ONNX session is lazily initialized and cached.
         self._session: Any = None

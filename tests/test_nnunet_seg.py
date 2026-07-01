@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -73,7 +74,7 @@ class TestNNUNetSegmentationConstruction:
         assert seg.model_type == "fullhead"
         assert seg.model_path == ""
         assert seg.use_gpu is False
-        assert seg.use_mirroring is True
+        assert seg.use_mirroring is False
         assert seg.ref_material == "water"
 
     def test_skull_construction(self):
@@ -81,6 +82,14 @@ class TestNNUNetSegmentationConstruction:
         assert seg.model_type == "skull"
         assert "tissue" in seg.materials
         assert "csf" not in seg.materials
+
+    def test_skull_label_convention(self):
+        """Skull must be material index 1 to match the ThresholdMRI /
+        saved-volume convention (label 1 == skull/bone) used by the N=180
+        validation producer and the tissue-masking recompute."""
+        for model_type in ("fullhead", "skull"):
+            seg = NNUNetSegmentation(model_type=model_type)
+            assert seg._material_indices()["skull"] == 1, model_type
 
     def test_fullhead_materials_auto_swap(self):
         seg = NNUNetSegmentation(model_type="fullhead")
@@ -209,3 +218,52 @@ class TestSegmentMocked:
         valid_indices = set(material_idx.values())
         unique = set(np.unique(result.to_numpy()))
         assert unique.issubset(valid_indices)
+
+
+# ---------------------------------------------------------------------------
+# Real ONNX inference (slow; not mocked)
+# ---------------------------------------------------------------------------
+
+class TestRealInference:
+    """Exercises the actual ONNX model end-to-end (no onnxruntime mocking).
+
+    These are integration smoke tests: they prove the session setup, IO tensor
+    plumbing, sliding-window reassembly, and label/material mapping work against
+    the real exported model. They are NOT accuracy tests: the input is a toy
+    volume and no Dice or CT-ground-truth claim is made. TTA is disabled to keep
+    the run short.
+    """
+
+    @pytest.mark.slow
+    @pytest.mark.filterwarnings("ignore")
+    def test_fullhead_real_onnx_smoke(self):
+        model_path = os.path.expanduser("~/.openlifu/models/fullhead_seg.onnx")
+        if not os.path.exists(model_path):
+            pytest.skip("fullhead_seg.onnx not present; skipping real-inference test")
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError:
+            pytest.skip("onnxruntime not installed")
+
+        seg = NNUNetSegmentation(
+            model_type="fullhead", model_path=model_path, use_mirroring=False,
+        )
+        volume = create_synthetic_volume(shape=(64, 64, 64))
+
+        result = seg._segment(volume)
+        out = np.asarray(result.to_numpy())
+
+        # Output geometry is preserved.
+        assert out.shape == volume.shape
+        # Every emitted label is a known material index.
+        material_idx = seg._material_indices()
+        valid = set(material_idx.values())
+        assert set(np.unique(out).tolist()).issubset(valid)
+        # Convention: skull is material index 1 (matches ThresholdMRI / saved volumes).
+        assert material_idx["skull"] == 1
+        # The full acoustic-param map builds without error and is finite, which
+        # exercises the same SegmentationMethod._map_params path the simulation uses.
+        params = seg.seg_params(volume)
+        for name in params.data_vars:
+            arr = np.asarray(params[name].data)
+            assert np.isfinite(arr).all()
