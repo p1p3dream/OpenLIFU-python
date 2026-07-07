@@ -35,10 +35,13 @@ from openlifu.gladys.models import (
     list_cached_models,
 )
 from openlifu.gladys.pipeline import GLADYSPipeline
+from openlifu.gladys.transducer import create_gladys_transducer
 
 __all__ = [
     # Pipeline
     "GLADYSPipeline",
+    # Transducer
+    "create_gladys_transducer",
     # Config constants
     "SDT_FREQUENCY_HZ",
     "SDT_PULSE_DURATION_S",

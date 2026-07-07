@@ -52,7 +52,7 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import xarray as xa
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import distance_transform_edt, map_coordinates
 
 # Ensure local openlifu is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -309,7 +309,8 @@ def load_nifti_as_xarray(nifti_path: Path) -> xa.DataArray:
     return xa.DataArray(data, dims=dim_names, coords=coords)
 
 
-FOCAL_ROI_RADIUS_MM = 40.0
+FOCAL_ROI_RADIUS_MM = 15.0
+SKULL_MARGIN_MM = 5.0
 
 
 def extract_focal_stats(
@@ -319,7 +320,17 @@ def extract_focal_stats(
     element_positions_mm: np.ndarray | None = None,
     exclusion_radius_mm: float = 3.0,
     roi_radius_mm: float = FOCAL_ROI_RADIUS_MM,
+    skull_mask: np.ndarray | None = None,
+    skull_margin_mm: float = SKULL_MARGIN_MM,
+    grid_spacing_mm: float | None = None,
 ) -> dict:
+    """Find the focal peak within an ROI sphere, excluding skull + margin.
+
+    When *skull_mask* (bool array, True=bone) is provided, voxels that are
+    skull OR within *skull_margin_mm* of the skull surface (via EDT) are
+    excluded from the peak search.  If no valid voxels remain after masking,
+    falls back to the unmasked ROI sphere.
+    """
     p_max = result["p_max"].to_numpy()
     dims = list(result["p_max"].dims)
     coord_arrays = {d: result.coords[d].to_numpy() for d in dims}
@@ -334,7 +345,32 @@ def extract_focal_stats(
     dist_from_target = np.sqrt(sum((m - t) ** 2 for m, t in zip(mg, target_mm)))
     roi_mask = dist_from_target <= roi_radius_mm
 
-    pmax_roi = np.where(roi_mask, p_max, -np.inf)
+    # Tissue-masked peak finding: exclude skull + margin from the ROI
+    if skull_mask is not None:
+        spacing = grid_spacing_mm if grid_spacing_mm is not None else float(
+            np.mean([np.abs(np.diff(coord_arrays[d])).mean() for d in dims])
+        )
+        spacing_tuple = (spacing, spacing, spacing)
+        # EDT: distance (mm) from every non-skull voxel to nearest skull voxel
+        dt_mm = distance_transform_edt(~skull_mask, sampling=spacing_tuple)
+        tissue_mask = ~skull_mask & (dt_mm >= skull_margin_mm)
+        valid_mask = roi_mask & tissue_mask
+        if not valid_mask.any():
+            logger.warning(
+                "%s: no valid tissue voxels in ROI (r=%.0f mm, margin=%.0f mm); "
+                "falling back to unmasked ROI",
+                label, roi_radius_mm, skull_margin_mm,
+            )
+            valid_mask = roi_mask
+        else:
+            logger.info(
+                "%s: tissue-masked ROI: %d valid voxels (skull margin=%.0f mm)",
+                label, int(valid_mask.sum()), skull_margin_mm,
+            )
+    else:
+        valid_mask = roi_mask
+
+    pmax_roi = np.where(valid_mask, p_max, -np.inf)
     roi_idx = np.unravel_index(pmax_roi.argmax(), pmax_roi.shape)
     focal_mm = np.array([float(coord_arrays[d][roi_idx[i]]) for i, d in enumerate(dims)])
     focal_error = float(np.linalg.norm(focal_mm - target_mm))
@@ -345,9 +381,9 @@ def extract_focal_stats(
     global_peak_mm = np.array([float(coord_arrays[d][global_idx[i]]) for i, d in enumerate(dims)])
 
     threshold_6db = p_focal_peak / 2.0
-    focal_region = roi_mask & (p_max >= threshold_6db)
-    spacing_mm = float(np.mean([np.diff(coord_arrays[d]).mean() for d in dims]))
-    focal_vol_mm3 = int(focal_region.sum()) * spacing_mm ** 3
+    focal_region = valid_mask & (p_max >= threshold_6db)
+    vox_spacing = float(np.mean([np.abs(np.diff(coord_arrays[d])).mean() for d in dims]))
+    focal_vol_mm3 = int(focal_region.sum()) * vox_spacing ** 3
 
     logger.info(
         "%s: focal_peak=%.4g Pa @ (%s) mm, error=%.2f mm; p@target=%.4g Pa (ROI r=%.0f mm)",
@@ -356,13 +392,14 @@ def extract_focal_stats(
         focal_error, p_at_target, roi_radius_mm,
     )
     logger.info(
-        "  global_max=%.4g Pa @ (%s) mm",
-        p_max_global, ", ".join(f"{v:.1f}" for v in global_peak_mm),
+        "  global_max=%.4g Pa @ (%s) mm; p_max_global=%.4g Pa",
+        p_max_global, ", ".join(f"{v:.1f}" for v in global_peak_mm), p_max_global,
     )
 
     return {
         "label": label,
         "max_pressure": p_max_global,
+        "p_max_global": p_max_global,
         "p_focal_peak": p_focal_peak,
         "focal_mm": focal_mm,
         "focal_error": focal_error,
@@ -1181,7 +1218,8 @@ def main():
     with gpu_flock():
         result_a = run_simulation(params=sim_params, delays=delays_corrected, ref_values_only=False, **common_kwargs)
     print(f"    Completed in {time.time()-t0:.1f}s")
-    stats_a = extract_focal_stats(result_a, target_mm, "SIM A (corrected+hetero)", element_positions_mm=positions)
+    stats_a = extract_focal_stats(result_a, target_mm, "SIM A (corrected+hetero)", element_positions_mm=positions,
+                                  skull_mask=skull_mask_sim, grid_spacing_mm=GRID_SPACING_MM)
     masked_a_20 = extract_masked_argmax(result_a, target_mm, positions, 20.0)
     probe_a = _run_timegated_probe(
         arr=arr, params=sim_params, delays=delays_corrected, apod=apod,
@@ -1197,7 +1235,8 @@ def main():
     with gpu_flock():
         result_b = run_simulation(params=sim_params, delays=delays_geo, ref_values_only=False, **common_kwargs)
     print(f"    Completed in {time.time()-t0:.1f}s")
-    stats_b = extract_focal_stats(result_b, target_mm, "SIM B (geometric+hetero)", element_positions_mm=positions)
+    stats_b = extract_focal_stats(result_b, target_mm, "SIM B (geometric+hetero)", element_positions_mm=positions,
+                                  skull_mask=skull_mask_sim, grid_spacing_mm=GRID_SPACING_MM)
     masked_b_20 = extract_masked_argmax(result_b, target_mm, positions, 20.0)
     probe_b = _run_timegated_probe(
         arr=arr, params=sim_params, delays=delays_geo, apod=apod,
@@ -1213,7 +1252,8 @@ def main():
     with gpu_flock():
         result_c = run_simulation(params=sim_params, delays=delays_geo, ref_values_only=True, **common_kwargs)
     print(f"    Completed in {time.time()-t0:.1f}s")
-    stats_c = extract_focal_stats(result_c, target_mm, "SIM C (geometric+water)", element_positions_mm=positions)
+    stats_c = extract_focal_stats(result_c, target_mm, "SIM C (geometric+water)", element_positions_mm=positions,
+                                  skull_mask=skull_mask_sim, grid_spacing_mm=GRID_SPACING_MM)
     masked_c_20 = extract_masked_argmax(result_c, target_mm, positions, 20.0)
     probe_c = _run_timegated_probe(
         arr=arr, params=sim_params, delays=delays_geo, apod=apod,
