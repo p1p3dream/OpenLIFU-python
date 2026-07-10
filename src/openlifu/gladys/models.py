@@ -33,15 +33,19 @@ DEFAULT_CACHE_DIR: Path = Path.home() / ".openlifu" / "models"
 ModelInfo = Dict[str, str]
 
 MODEL_REGISTRY: Dict[str, ModelInfo] = {
+    # Full-head segmentation: multi-class nnU-Net model that segments the
+    # complete head volume (skin, skull, CSF, grey matter, white matter, etc.)
     "fullhead_seg_v1": {
-        "url": "https://github.com/OpenwaterHealth/OpenLIFU-python/releases/download/models-v1/fullhead_seg_v1.onnx",
-        "sha256": "placeholder_sha256_will_be_updated_on_release",
-        "filename": "fullhead_seg_v1.onnx",
+        "url": "https://github.com/OpenwaterHealth/OpenLIFU-python/releases/download/models-v1/fullhead_seg.onnx",
+        "sha256": "784c339f9eb67cd7eaa3ffba6535d4ff692ec90db78f10a5ac085f7bd016a4f0",
+        "filename": "fullhead_seg.onnx",
     },
+    # Skull segmentation: binary nnU-Net model that segments the skull layer
+    # for acoustic simulation and treatment planning
     "skull_seg_v1": {
-        "url": "https://github.com/OpenwaterHealth/OpenLIFU-python/releases/download/models-v1/skull_seg_v1.onnx",
-        "sha256": "placeholder_sha256_will_be_updated_on_release",
-        "filename": "skull_seg_v1.onnx",
+        "url": "https://github.com/OpenwaterHealth/OpenLIFU-python/releases/download/models-v1/skull_seg.onnx",
+        "sha256": "39251ea118f7112b349000314155fd2f59171002619c07a9471695cd2530520f",
+        "filename": "skull_seg.onnx",
     },
 }
 

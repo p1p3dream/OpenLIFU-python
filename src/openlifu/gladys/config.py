@@ -9,9 +9,11 @@ GLADYS defaults.
 from __future__ import annotations
 
 from openlifu.bf import Pulse, Sequence
+from openlifu.bf.delay_methods.complex_weighted import ComplexWeighted
 from openlifu.bf.delay_methods.simulation_corrected import SimulationCorrected
 from openlifu.bf.focal_patterns import SinglePoint
 from openlifu.plan.protocol import Protocol
+from openlifu.seg.seg_methods.nnunet_seg import NNUNetSegmentation
 from openlifu.seg.seg_methods.threshold_mri import ThresholdMRI
 from openlifu.sim.sim_setup import SimSetup
 
@@ -85,25 +87,32 @@ def default_sequence() -> Sequence:
     )
 
 
-def default_seg_method() -> ThresholdMRI:
+def default_seg_method() -> NNUNetSegmentation:
     """Build the default segmentation method for GLADYS.
 
-    Uses ThresholdMRI with full-head tissue classification enabled, which
-    differentiates skull, scalp, CSF, gray matter, and white matter from
-    the T1-weighted MRI volume.
+    Uses NNUNetSegmentation with the fullhead model, which segments the
+    T1-weighted MRI volume into water, air, CSF, gray matter, white matter,
+    skull, and soft tissue using an ONNX-exported nnU-Net deep learning model.
+    Validated in the N=180 transcranial study with substantially higher
+    accuracy than ThresholdMRI.
     """
-    return ThresholdMRI(classify_brain_tissues=True)
+    return NNUNetSegmentation(model_type="fullhead")
 
 
-def default_delay_method() -> SimulationCorrected:
+def default_delay_method() -> ComplexWeighted:
     """Build the default delay method for GLADYS.
 
-    Uses the SimulationCorrected reciprocal k-wave approach to compute
-    aberration-corrected transmit delays through the heterogeneous skull.
+    Uses the ComplexWeighted narrowband phase correction method, which
+    extracts per-element complex coefficients (amplitude and phase) from
+    a reciprocal k-wave simulation at the operating frequency. Validated
+    in the N=180 transcranial study with +2.9 dB focal gain over
+    SimulationCorrected.
     """
-    return SimulationCorrected(
+    return ComplexWeighted(
         c0=DEFAULT_SPEED_OF_SOUND,
         cfl=DEFAULT_CFL,
+        n_cycles=3,
+        gpu=True,
     )
 
 

@@ -5,8 +5,8 @@ ready sonication solution:
 
     1. Load MRI (NIfTI) as an xarray.DataArray
     2. Construct a target Point from coordinates
-    3. Run tissue segmentation (ThresholdMRI with brain classification)
-    4. Compute aberration-corrected transmit delays (SimulationCorrected)
+    3. Run tissue segmentation (NNUNetSegmentation, fullhead ONNX model)
+    4. Compute aberration-corrected transmit delays (ComplexWeighted)
     5. Run k-wave simulation and scale to target pressure
     6. Upload the resulting Solution to the LIFU hardware
 
@@ -39,6 +39,7 @@ from openlifu.plan.solution_analysis import SolutionAnalysis
 from openlifu.xdc import Transducer
 
 from .config import DEFAULT_VOLTAGE, default_protocol
+from .targeting import position_transducer
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +48,8 @@ class GLADYSPipeline:
     """End-to-end treatment planning pipeline for the GLADYS platform.
 
     Wraps OpenLIFU's Protocol/Solution machinery with GLADYS-specific
-    defaults (500 kHz SDT, 86 ms pulse, ThresholdMRI segmentation,
-    SimulationCorrected delays) so a treatment plan can be produced
+    defaults (500 kHz SDT, 86 ms pulse, NNUNetSegmentation,
+    ComplexWeighted phase correction) so a treatment plan can be produced
     from just an MRI path and a target coordinate.
 
     Args:
@@ -151,6 +152,7 @@ class GLADYSPipeline:
         target_position: Sequence[float],
         transducer: Optional[Transducer] = None,
         target_units: str = "mm",
+        entry_point: Optional[Sequence[float]] = None,
         simulate: bool = True,
         scale: bool = True,
     ) -> Tuple[Solution, xa.Dataset, SolutionAnalysis]:
@@ -168,6 +170,12 @@ class GLADYSPipeline:
             transducer: Override the pipeline's transducer for this run.
             target_units: Spatial units for *target_position*
                 (default ``"mm"``).
+            entry_point: Optional 3-element sequence of ``[x, y, z]``
+                coordinates (in mm) for the skull entry point. When
+                provided, the transducer is repositioned so that its
+                focus lands on *target_position* and the array faces the
+                entry point. When omitted, the transducer is used as-is
+                (caller is responsible for prior positioning).
             simulate: Whether to run the k-wave simulation
                 (default True).
             scale: Whether to rescale the solution to the protocol's
@@ -194,16 +202,39 @@ class GLADYSPipeline:
                 "or as an argument to plan_treatment."
             )
 
-        # Step 1: Load MRI volume
-        logger.info("GLADYS pipeline: loading MRI from %s", mri_path)
-        volume = self.load_mri(mri_path)
-
-        # Step 2: Build the target Point
+        # Validate target shape early (before any positioning or loading)
         pos = np.asarray(target_position, dtype=float)
         if pos.shape != (3,):
             raise ValueError(
                 f"target_position must have exactly 3 elements, got shape {pos.shape}"
             )
+
+        # Step 0 (optional): Reposition the transducer toward the target
+        if entry_point is not None:
+            if target_units != "mm":
+                raise ValueError(
+                    f"entry_point requires target_position in mm, "
+                    f"but target_units='{target_units}'. Convert coordinates "
+                    f"to mm before calling plan_treatment with entry_point."
+                )
+            entry_mm = np.asarray(entry_point, dtype=float)
+            if entry_mm.shape != (3,):
+                raise ValueError(
+                    f"entry_point must have exactly 3 elements, got shape {entry_mm.shape}"
+                )
+            logger.info(
+                "GLADYS pipeline: positioning transducer "
+                "(entry=[%.2f, %.2f, %.2f], target=[%.2f, %.2f, %.2f])",
+                entry_mm[0], entry_mm[1], entry_mm[2],
+                pos[0], pos[1], pos[2],
+            )
+            arr = position_transducer(arr, target_mm=pos, entry_point_mm=entry_mm)
+
+        # Step 1: Load MRI volume
+        logger.info("GLADYS pipeline: loading MRI from %s", mri_path)
+        volume = self.load_mri(mri_path)
+
+        # Step 2: Build the target Point
         target = Point(
             position=pos,
             id="gladys_target",

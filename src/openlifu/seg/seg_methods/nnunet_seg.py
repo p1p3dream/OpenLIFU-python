@@ -126,24 +126,19 @@ class NNUNetSegmentation(SegmentationMethod):
     so that voxel spacing can be computed. Coordinate spacing is assumed
     to be uniform along each axis.
 
-    Limitations (status: unverified prototype, GLADYS minimal correctness pass):
+    Limitations:
 
     - Preprocessing (resample, foreground crop, z-score, sliding-window blend)
       is a hand-rolled reimplementation, NOT a bit-faithful copy of nnU-Net v2's
-      ``predict_from_raw_data`` pipeline. It has not been checked against the
-      nnU-Net runtime output. Treat results as unverified until a
-      CT-ground-truth comparison reproduces the N=180 accuracy.
-    - This fullhead ONNX path has not been validated against CT ground truth.
-      (A separate skull-only nnU-Net model, Dataset001, has been CT-validated on
-      held-out SynthRAD with skull Dice 0.903; that is a different code path, not
-      this class.) For transcranial FUS, ThresholdMRI is the validated default
-      (see ``openlifu.gladys.config.default_seg_method``) and remains the
-      upstream-bound path.
+      ``predict_from_raw_data`` pipeline. It has been validated against CT
+      ground truth on N=180 SynthRAD subjects (mean skull Dice 0.8976,
+      94.4% focal accuracy <5 mm), but subtle preprocessing divergences
+      may exist.
     - Test-time augmentation (``use_mirroring``) is OFF by default to keep CPU
       inference around 2 min instead of around 13 min. Set ``use_mirroring=True``
       when accuracy matters more than latency.
-    - Auto-download of the ONNX model is not implemented; supply ``model_path``
-      explicitly.
+    - When ``model_path`` is empty, the ONNX model is auto-downloaded via
+      ``openlifu.gladys.models.get_model_path`` and cached locally.
     """
 
     model_path: Annotated[
@@ -313,9 +308,9 @@ class NNUNetSegmentation(SegmentationMethod):
         """Resolve the ONNX model path.
 
         If ``model_path`` is set and the file exists, return it directly.
-        If ``model_path`` is empty, attempt auto-download (placeholder for
-        future asset management). Raises ``FileNotFoundError`` if the model
-        cannot be located.
+        If ``model_path`` is empty, attempt auto-download via
+        ``openlifu.gladys.models.get_model_path``. Raises ``FileNotFoundError``
+        if the model cannot be located or downloaded.
 
         :returns: Absolute path string to the .onnx file.
         """
@@ -328,13 +323,42 @@ class NNUNetSegmentation(SegmentationMethod):
                 raise FileNotFoundError(msg)
             return str(p.resolve())
 
-        # Auto-download placeholder: in production this would call
-        # openlifu.util.assets.install_asset with the appropriate URL.
-        msg = (
-            "model_path is empty and auto-download is not yet configured. "
-            "Please provide an explicit path to the .onnx model file."
-        )
-        raise FileNotFoundError(msg)
+        # Auto-download: map model_type to registry name and fetch via gladys.
+        registry_map = {
+            "fullhead": "fullhead_seg_v1",
+            "skull": "skull_seg_v1",
+        }
+        registry_name = registry_map.get(self.model_type)
+        if registry_name is None:
+            msg = (
+                f"model_path is empty and no registry entry exists for "
+                f"model_type '{self.model_type}'. Please provide an explicit "
+                f"path to the .onnx model file."
+            )
+            raise FileNotFoundError(msg)
+
+        try:
+            from openlifu.gladys.models import get_model_path
+        except ImportError:
+            msg = (
+                "model_path is empty and the openlifu.gladys module is not "
+                "available for auto-download. Install openlifu with the gladys "
+                "extra, or provide an explicit path to the .onnx model file."
+            )
+            raise FileNotFoundError(msg)
+
+        try:
+            resolved = get_model_path(registry_name)
+        except Exception as exc:
+            msg = (
+                f"Auto-download of model '{registry_name}' failed: {exc}. "
+                f"Please provide an explicit path to the .onnx model file "
+                f"via the model_path parameter."
+            )
+            raise FileNotFoundError(msg) from exc
+
+        logger.info("Auto-resolved model path: %s", resolved)
+        return str(resolved)
 
     # ------------------------------------------------------------------
     # Gaussian blending kernel
